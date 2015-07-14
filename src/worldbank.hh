@@ -1,9 +1,8 @@
 /* World Bank specific business logic.
  */
 
-#ifndef __WORLDBANK_HH__
-#define __WORLDBANK_HH__
-#pragma once
+#ifndef WORLDBANK_HH_
+#define WORLDBANK_HH_
 
 #include <cmath>
 #include <cstdint>
@@ -38,6 +37,6 @@ round (double x)
 
 } // namespace worldbank
 
-#endif /* __WORLDBANK_HH__ */
+#endif /* WORLDBANK_HH_ */
 
 /* eof */

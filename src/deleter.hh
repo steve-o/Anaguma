@@ -1,9 +1,8 @@
 /* unique_ptr deleters
  */
 
-#ifndef __DELETER_HH__
-#define __DELETER_HH__
-#pragma once
+#ifndef DELETER_HH_
+#define DELETER_HH_
 
 #include <memory>
 
@@ -23,6 +22,6 @@ namespace internal {
 
 } /* namespace internal */
 
-#endif /* __DELETER_HH__ */
+#endif /* DELETER_HH_ */
 
 /* eof */

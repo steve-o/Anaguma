@@ -1,4 +1,4 @@
-/* RFA 7.2 interactive provider.
+/* UPA 7.4 interactive provider.
  */
 
 #include "anaguma.hh"
@@ -33,6 +33,10 @@ public:
 			logging::ENABLE_DCHECK_FOR_NON_OFFICIAL_RELEASE_BUILDS
 			);
 		logging::SetLogMessageHandler (log_handler);
+		logging::SetLogItems (false, /* process id */
+				      false, /* thread id */
+				      true,  /* timestamp */
+				      true); /* tickcount */
 	}
 
 protected:

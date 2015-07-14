@@ -1,9 +1,8 @@
-/* RFA provider client session.
+/* UPA provider client session.
  */
 
-#ifndef __CLIENT_HH__
-#define __CLIENT_HH__
-#pragma once
+#ifndef CLIENT_HH_
+#define CLIENT_HH_
 
 #include <cstdint>
 #include <memory>
@@ -15,10 +14,10 @@
 /* Boost noncopyable base class */
 #include <boost/utility.hpp>
 
-/* RFA 7.2 */
-#include <rfa/rfa.hh>
+/* UPA 7.4 */
+#include <upa/upa.h>
 
-#include "rfa.hh"
+#include "upa.hh"
 #include "config.hh"
 #include "deleter.hh"
 
@@ -26,38 +25,36 @@ namespace anaguma
 {
 /* Performance Counters */
 	enum {
-		CLIENT_PC_RFA_MSGS_SENT,
-		CLIENT_PC_RFA_EVENTS_RECEIVED,
-		CLIENT_PC_RFA_EVENTS_DISCARDED,
-		CLIENT_PC_OMM_SOLICITED_ITEM_EVENTS_RECEIVED,
-		CLIENT_PC_OMM_SOLICITED_ITEM_EVENTS_DISCARDED,
+		CLIENT_PC_UPA_MSGS_SENT,
+		CLIENT_PC_UPA_MSGS_RECEIVED,
+		CLIENT_PC_UPA_MSGS_REJECTED,
 		CLIENT_PC_REQUEST_MSGS_RECEIVED,
-		CLIENT_PC_REQUEST_MSGS_DISCARDED,
+		CLIENT_PC_REQUEST_MSGS_REJECTED,
+		CLIENT_PC_CLOSE_MSGS_RECEIVED,
+		CLIENT_PC_CLOSE_MSGS_DISCARDED,
 		CLIENT_PC_MMT_LOGIN_RECEIVED,
-		CLIENT_PC_MMT_LOGIN_VALIDATED,
 		CLIENT_PC_MMT_LOGIN_MALFORMED,
 		CLIENT_PC_MMT_LOGIN_REJECTED,
 		CLIENT_PC_MMT_LOGIN_ACCEPTED,
 		CLIENT_PC_MMT_LOGIN_RESPONSE_VALIDATED,
 		CLIENT_PC_MMT_LOGIN_RESPONSE_MALFORMED,
 		CLIENT_PC_MMT_LOGIN_EXCEPTION,
+		CLIENT_PC_MMT_LOGIN_CLOSE_RECEIVED,
 		CLIENT_PC_MMT_DIRECTORY_REQUEST_RECEIVED,
-		CLIENT_PC_MMT_DIRECTORY_REQUEST_VALIDATED,
-		CLIENT_PC_MMT_DIRECTORY_REQUEST_MALFORMED,
 		CLIENT_PC_MMT_DIRECTORY_VALIDATED,
 		CLIENT_PC_MMT_DIRECTORY_MALFORMED,
 		CLIENT_PC_MMT_DIRECTORY_SENT,
 		CLIENT_PC_MMT_DIRECTORY_EXCEPTION,
+		CLIENT_PC_MMT_DIRECTORY_CLOSE_RECEIVED,
 		CLIENT_PC_MMT_DICTIONARY_REQUEST_RECEIVED,
-		CLIENT_PC_MMT_DICTIONARY_REQUEST_VALIDATED,
-		CLIENT_PC_MMT_DICTIONARY_REQUEST_MALFORMED,
+		CLIENT_PC_MMT_DICTIONARY_CLOSE_RECEIVED,
 		CLIENT_PC_ITEM_REQUEST_RECEIVED,
-		CLIENT_PC_ITEM_REISSUE_REQUEST_RECEIVED,
-		CLIENT_PC_ITEM_CLOSE_REQUEST_RECEIVED,
 		CLIENT_PC_ITEM_REQUEST_MALFORMED,
 		CLIENT_PC_ITEM_REQUEST_BEFORE_LOGIN,
+		CLIENT_PC_ITEM_STREAMING_REQUEST_RECEIVED,
+		CLIENT_PC_ITEM_REISSUE_REQUEST_RECEIVED,
+		CLIENT_PC_ITEM_SNAPSHOT_REQUEST_RECEIVED,
 		CLIENT_PC_ITEM_DUPLICATE_SNAPSHOT,
-		CLIENT_PC_ITEM_REQUEST_DISCARDED,
 		CLIENT_PC_ITEM_REQUEST_REJECTED,
 		CLIENT_PC_ITEM_VALIDATED,
 		CLIENT_PC_ITEM_MALFORMED,
@@ -65,6 +62,9 @@ namespace anaguma
 		CLIENT_PC_ITEM_SENT,
 		CLIENT_PC_ITEM_CLOSED,
 		CLIENT_PC_ITEM_EXCEPTION,
+		CLIENT_PC_ITEM_CLOSE_RECEIVED,
+		CLIENT_PC_ITEM_CLOSE_MALFORMED,
+		CLIENT_PC_ITEM_CLOSE_VALIDATED,
 		CLIENT_PC_OMM_INACTIVE_CLIENT_SESSION_RECEIVED,
 		CLIENT_PC_OMM_INACTIVE_CLIENT_SESSION_EXCEPTION,
 		CLIENT_PC_MAX
@@ -75,54 +75,69 @@ namespace anaguma
 
 	class client_t :
 		public std::enable_shared_from_this<client_t>,
-		public rfa::common::Client,
 		boost::noncopyable
 	{
 	public:
-		client_t (std::shared_ptr<provider_t> provider, const rfa::common::Handle* handle, const char* address);
+		client_t (std::shared_ptr<provider_t> provider, RsslChannel* handle, const char* address);
 		~client_t();
 
-		bool GetAssociatedMetaInfo();
+		bool Init();
+		bool Close();
 
-/* RFA event callback. */
-		void processEvent (const rfa::common::Event& event) override;
-
-		bool Init (rfa::common::Handle*const handle);
-		rfa::common::Handle*const GetHandle() const {
+		RsslChannel*const GetHandle() const {
 			return handle_;
 		}
 		uint8_t GetRwfMajorVersion() const {
-			return rwf_major_version_;
+			return handle_->majorVersion;
 		}
 		uint8_t GetRwfMinorVersion() const {
-			return rwf_minor_version_;
+			return handle_->minorVersion;
 		}
 
 	private:
-		void OnOMMSolicitedItemEvent (const rfa::sessionLayer::OMMSolicitedItemEvent& event);
-		void OnReqMsg (const rfa::message::ReqMsg& msg, rfa::sessionLayer::RequestToken*const token);
-		void OnLoginRequest (const rfa::message::ReqMsg& msg, rfa::sessionLayer::RequestToken*const token);
-		void OnDirectoryRequest (const rfa::message::ReqMsg& msg, rfa::sessionLayer::RequestToken*const token);
-		void OnDictionaryRequest (const rfa::message::ReqMsg& msg, rfa::sessionLayer::RequestToken*const token);
-		void OnItemRequest (const rfa::message::ReqMsg& msg, rfa::sessionLayer::RequestToken*const token);
-		void OnItemSnapshotRequest (const rfa::message::ReqMsg& msg, rfa::sessionLayer::RequestToken*const token);
-		void OnItemStreamingRequest (const rfa::message::ReqMsg& msg, rfa::sessionLayer::RequestToken*const token);
-		void OnOMMItemEvent (const rfa::sessionLayer::OMMItemEvent& event);
-                void OnRespMsg (const rfa::message::RespMsg& msg);
-                void OnLoginResponse (const rfa::message::RespMsg& msg);
-                void OnLoginSuccess (const rfa::message::RespMsg& msg);
-                void OnLoginSuspect (const rfa::message::RespMsg& msg);
-                void OnLoginClosed (const rfa::message::RespMsg& msg);
-		void OnOMMInactiveClientSessionEvent (const rfa::sessionLayer::OMMInactiveClientSessionEvent& event);
+		bool OnMsg (const RsslMsg* msg);
 
-		bool RejectLogin (const rfa::message::ReqMsg& msg, rfa::sessionLayer::RequestToken*const login_token);
-		bool AcceptLogin (const rfa::message::ReqMsg& msg, rfa::sessionLayer::RequestToken*const login_token);
-		bool SendDirectoryResponse (rfa::sessionLayer::RequestToken*const token, const char* service_name, uint32_t filter_mask);
-		bool SendClose (rfa::sessionLayer::RequestToken*const token, uint32_t service_id, uint8_t model_type, const char* name, bool use_attribinfo_in_updates, uint8_t status_code);
+		bool OnRequestMsg (const RsslRequestMsg* msg);
+		bool OnLoginRequest (const RsslRequestMsg* msg);
+		bool OnDirectoryRequest (const RsslRequestMsg* msg);
+		bool OnDictionaryRequest (const RsslRequestMsg* msg);
+		bool OnItemRequest (const RsslRequestMsg* msg);
+		bool OnItemSnapshotRequest (const RsslRequestMsg* msg, int32_t token);
+		bool OnItemStreamingRequest (const RsslRequestMsg* msg, int32_t token);
 
-		bool SendInitial (uint32_t service_id, const rfa::common::RFA_String& stream_name, const boost::posix_time::ptime& timestamp, uint8_t rwf_major_version, uint8_t rwf_minor_version, rfa::sessionLayer::RequestToken*const token);
+		bool OnCloseMsg (const RsslCloseMsg* msg);
+		bool OnItemClose (const RsslCloseMsg* msg);
 
-		uint32_t Submit (rfa::message::RespMsg*const msg, rfa::sessionLayer::RequestToken*const token, void* closure) throw (rfa::common::InvalidUsageException);
+		bool RejectLogin (const RsslRequestMsg* msg, int32_t login_token);
+		bool AcceptLogin (const RsslRequestMsg* msg, int32_t login_token);
+
+		bool SendDirectoryResponse (int32_t token, const char* service_name, uint32_t filter_mask);
+bool SendDirectoryUpdate (const char* service_name);
+		bool SendClose (int32_t token, uint16_t service_id, uint8_t model_type, const char* name, size_t name_len, bool use_attribinfo_in_updates, uint8_t status_code);
+		bool SendInitial (uint16_t service_id, int32_t token, const char* name, size_t name_len, const boost::posix_time::ptime& timestamp);
+		int Submit (RsslBuffer* buf);
+
+		const boost::posix_time::ptime& NextPing() const {
+			return next_ping_;
+		}
+		const boost::posix_time::ptime& NextPong() const {
+			return next_pong_;
+		}
+		void SetNextPing (const boost::posix_time::ptime& time_) {
+			next_ping_ = time_;
+		}
+		void SetNextPong (const boost::posix_time::ptime& time_) {
+			next_pong_ = time_;
+		}
+		void IncrementPendingCount() {
+			pending_count_++;
+		}
+		void ClearPendingCount() {
+			pending_count_ = 0;
+		}
+		unsigned GetPendingCount() const {
+			return pending_count_;
+		}
 
 		std::shared_ptr<provider_t> provider_;
 
@@ -133,18 +148,13 @@ namespace anaguma
 		std::string address_;
 		std::string name_;
 
-/* RFA Client Session event consumer. */
-		rfa::common::Handle* handle_;
-
-/* RFA login token for closing out the Client Session. */
-		rfa::sessionLayer::RequestToken* login_token_;
+/* UPA socket. */
+		RsslChannel* handle_;
+/* Pending messages to flush. */
+		unsigned pending_count_;
 
 /* Watchlist of all items. */
-		std::unordered_map<rfa::sessionLayer::RequestToken*const, std::weak_ptr<item_stream_t>> items_;
-
-/* Reuters Wire Format versions. */
-		uint8_t rwf_major_version_;
-		uint8_t rwf_minor_version_;
+//		std::unordered_map<rfa::sessionLayer::RequestToken*const, std::weak_ptr<item_stream_t>> items_;
 
 /* Pre-allocated parsing state */
 		std::string url_, value_;
@@ -154,6 +164,12 @@ namespace anaguma
 /* Item requests may appear before login success has been granted.
  */
 		bool is_logged_in_;
+		int32_t login_token_;
+int32_t directory_token_;
+/* RSSL keepalive state. */
+		boost::posix_time::ptime next_ping_;
+		boost::posix_time::ptime next_pong_;
+		unsigned ping_interval_;
 
 		friend provider_t;
 
@@ -162,17 +178,17 @@ namespace anaguma
 		uint32_t cumulative_stats_[CLIENT_PC_MAX];
 		uint32_t snap_stats_[CLIENT_PC_MAX];
 
-#ifdef STITCHMIB_H
+#ifdef ANAGUMAMIB_H
 		friend Netsnmp_Next_Data_Point anagumaClientTable_get_next_data_point;
 		friend Netsnmp_Node_Handler anagumaClientTable_handler;
 
 		friend Netsnmp_Next_Data_Point anagumaClientPerformanceTable_get_next_data_point;
 		friend Netsnmp_Node_Handler anagumaClientPerformanceTable_handler;
-#endif /* STITCHMIB_H */
+#endif /* ANAGUMAMIB_H */
 	};
 
 } /* namespace anaguma */
 
-#endif /* __CLIENT_HH__ */
+#endif /* CLIENT_HH_ */
 
 /* eof */

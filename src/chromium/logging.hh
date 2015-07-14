@@ -608,7 +608,7 @@ inline bool InitLogging(const char* log_file,
 #define NOTIMPLEMENTED_MSG "Not implemented reached in " << BOOST_CURRENT_FUNCTION
 
 #if NOTIMPLEMENTED_POLICY == 0
-#	define NOTIMPLEMENTED() ;
+#	define NOTIMPLEMENTED() EAT_STREAM_PARAMETERS
 #elif NOTIMPLEMENTED_POLICY == 1
 // TODO, figure out how to generate a warning
 #	define NOTIMPLEMENTED() static_assert(false, NOT_IMPLEMENTED)
@@ -620,9 +620,11 @@ inline bool InitLogging(const char* log_file,
 #	define NOTIMPLEMENTED() LOG(ERROR) << NOTIMPLEMENTED_MSG
 #elif NOTIMPLEMENTED_POLICY == 5
 #	define NOTIMPLEMENTED() do {\
-		static int count = 0;\
-		LOG_IF(ERROR, 0 == count++) << NOTIMPLEMENTED_MSG;\
-		} while(0)
+		static bool logged_once = false;\
+		LOG_IF(ERROR, !logged_once) << NOTIMPLEMENTED_MSG;\
+		logged_once = true;\
+		} while(0)\
+		EAT_STREAM_PARAMETERS
 #endif
 
 #endif /* CHROMIUM_LOGGING_HH__ */

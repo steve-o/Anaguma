@@ -1,41 +1,29 @@
-# CMake build script for RFA interactive provider
+# CMake build script for UPA interactive provider
 # x64 Windows Server-only
-# 2012/07/18 -- Steven.McCoy@thomsonreuters.com
+# 2013/02/07 -- Steven.McCoy@thomsonreuters.com
 
 cmake_minimum_required (VERSION 2.8.8)
 
 project (Anaguma)
 
 # Thomson Reuters Robust Foundation API
-set(RFA_ROOT D:/rfa7.4.0.L1.win-shared.rrg)
-set(RFA_INCLUDE_DIRS
-	${RFA_ROOT}/Include
-	${RFA_ROOT}/Include/rwf
+set(UPA_ROOT D:/upa7.5.0.L1.win.rrg)
+set(UPA_INCLUDE_DIRS
+	${UPA_ROOT}/Include
 )
-set(RFA_LIBRARY_DIR ${RFA_ROOT}/Libs/WIN_64_VS100/Release_MD)
-set(RFA_LIBRARY_DIRS ${RFA_LIBRARY_DIR})
-set(RFA_LIBRARIES
-	RFA7_Common100_x64.lib
-	RFA7_Config100_x64.lib
-	RFA7_Logger100_x64.lib
-	RFA7_Data100_x64.lib
-	RFA7_Connections100_x64.lib
-	RFA7_Connections_OMM100_x64.lib
-	RFA7_SessionLayer100_x64.lib
-	DACS7_lock100_x64.lib
+set(UPA_LIBRARY_DIR ${UPA_ROOT}/Libs/WIN_64_VS100/Debug_MDd)
+set(UPA_LIBRARY_DIRS ${UPA_LIBRARY_DIR})
+set(UPA_LIBRARIES
+	librsslData
+	librsslMessages
+	librsslTransport
 )
 
 # Boost headers plus built libraries
-set(BOOST_ROOT D:/boost_1_51_0)
+set(BOOST_ROOT D:/boost_1_54_0)
 set(BOOST_LIBRARYDIR ${BOOST_ROOT}/stage/lib)
 set(Boost_USE_STATIC_LIBS ON)
-find_package (Boost 1.50 COMPONENTS chrono thread REQUIRED)
-
-# Boost Atomics
-set(Boost_INCLUDE_DIRS
-	"D:/boost.atomic"
-	${Boost_INCLUDE_DIRS}
-)
+find_package (Boost 1.50 COMPONENTS atomic chrono thread REQUIRED)
 
 #-----------------------------------------------------------------------------
 # force off-tree build
@@ -71,8 +59,8 @@ add_definitions(
 	-DWIN32_LEAN_AND_MEAN
 # Windows Server 2008 R2
 	-D_WIN32_WINNT=0x0601
-# RFA version
-        -DRFA_LIBRARY_VERSION="7.4.0."
+# UPA version
+        -DUPA_LIBRARY_VERSION="7.5.0."
 )
 
 # Parallel make.
@@ -95,12 +83,11 @@ set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /GS-")
 set(cxx-sources
 	src/client.cc
 	src/config.cc
-	src/error.cc
 	src/main.cc
 	src/anaguma.cc
 	src/provider.cc
-	src/rfa.cc
-	src/rfa_logging.cc
+	src/upa.cc
+	src/upaostream.cc
 	src/chromium/chromium_switches.cc
 	src/chromium/command_line.cc
 	src/chromium/debug/stack_trace.cc
@@ -119,12 +106,12 @@ set(cxx-sources
 include_directories(
 	include
 	${CMAKE_CURRENT_BINARY_DIR}
-	${RFA_INCLUDE_DIRS}
+	${UPA_INCLUDE_DIRS}
 	${Boost_INCLUDE_DIRS}
 )
 
 link_directories(
-	${RFA_LIBRARY_DIRS}
+	${UPA_LIBRARY_DIRS}
 	${Boost_LIBRARY_DIRS}
 )
 
@@ -134,10 +121,11 @@ link_directories(
 add_executable(Anaguma ${cxx-sources})
 
 target_link_libraries(Anaguma
-	${RFA_LIBRARIES}
+	${UPA_LIBRARIES}
 	${Boost_LIBRARIES}
 	ws2_32.lib
-	dbghelp.lib
+	wininet.lib
+	dbghelp.lib	
 )
 
 # end of file

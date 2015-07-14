@@ -1,4 +1,4 @@
-/* RFA provider client session.
+/* UPA provider client session.
  */
 
 #include "client.hh"
@@ -11,10 +11,13 @@
 #include "chromium/logging.hh"
 #include "chromium/string_piece.hh"
 #include "googleurl/url_parse.h"
-#include "error.hh"
-#include "rfaostream.hh"
+//#include "error.hh"
+#include "upaostream.hh"
 #include "provider.hh"
 #include "worldbank.hh"
+
+
+#define MAX_MSG_SIZE 4096
 
 /* RDM FIDs. */
 static const int kRdmProductPermissionId	= 1;
@@ -36,8 +39,6 @@ static const int kRdmActivityDate1Id		= 875;
 static const boost::gregorian::date kUnixEpoch (1970, 1, 1);
 
 
-using rfa::common::RFA_String;
-
 /* Convert Posix time to Unix Epoch time.
  */
 template< typename TimeT >
@@ -52,154 +53,195 @@ to_unix_epoch (
 
 anaguma::client_t::client_t (
 	std::shared_ptr<anaguma::provider_t> provider,
-	const rfa::common::Handle* handle,
+	RsslChannel* handle,
 	const char* address
 	) :
 	creation_time_ (boost::posix_time::second_clock::universal_time()),
 	last_activity_ (creation_time_),
 	provider_ (provider),
 	address_ (address),
-	handle_ (nullptr),
-	login_token_ (nullptr),
-	rwf_major_version_ (0),
-	rwf_minor_version_ (0),
-	is_logged_in_ (false)
+	handle_ (handle),
+	pending_count_ (0),
+	is_logged_in_ (false),
+	login_token_ (0)
 {
 	ZeroMemory (cumulative_stats_, sizeof (cumulative_stats_));
 	ZeroMemory (snap_stats_, sizeof (snap_stats_));
 
 /* Set logger ID */
 	std::ostringstream ss;
-	ss << handle << ':';
+	ss << handle_ << ':';
 	prefix_.assign (ss.str());
 }
 
 anaguma::client_t::~client_t()
 {
+	DLOG(INFO) << "~client_t";
+/* Remove reference on containing provider. */
+	provider_.reset();
+
 	using namespace boost::posix_time;
 	const auto uptime = second_clock::universal_time() - creation_time_;
 	VLOG(3) << prefix_ << "Summary: {"
 		 " \"Uptime\": \"" << to_simple_string (uptime) << "\""
-		", \"RfaEventsReceived\": " << cumulative_stats_[CLIENT_PC_RFA_EVENTS_RECEIVED] <<
-		", \"RfaMessagesSent\": " << cumulative_stats_[CLIENT_PC_RFA_MSGS_SENT] <<
+		", \"MsgsReceived\": " << cumulative_stats_[CLIENT_PC_UPA_MSGS_RECEIVED] <<
+		", \"MsgsSent\": " << cumulative_stats_[CLIENT_PC_UPA_MSGS_SENT] <<
+		", \"MsgsRejected\": " << cumulative_stats_[CLIENT_PC_UPA_MSGS_REJECTED] <<
 		" }";
 }
 
 bool
-anaguma::client_t::Init (
-	rfa::common::Handle*const handle
-	)
+anaguma::client_t::Init()
 {
-/* save non-const client session handle. */
-	handle_ = handle;
-	return true;
-}
+	RsslChannelInfo info;
+	RsslError rssl_err;
+	RsslRet rc;
 
-bool
-anaguma::client_t::GetAssociatedMetaInfo()
-{
 	DCHECK(nullptr != handle_);
-
 	last_activity_ = boost::posix_time::second_clock::universal_time();
 
 /* Store negotiated Reuters Wire Format version information. */
-	auto& map = provider_->map_;
-	map.setAssociatedMetaInfo (*handle_);
-	rwf_major_version_ = map.getMajorVersion();
-	rwf_minor_version_ = map.getMinorVersion();
+	rc = rsslGetChannelInfo (handle_, &info, &rssl_err);
+	if (RSSL_RET_SUCCESS != rc) {
+		LOG(ERROR) << prefix_ << "rsslGetChannelInfo: { "
+			  "\"rsslErrorId\": " << rssl_err.rsslErrorId << ""
+			", \"sysError\": " << rssl_err.sysError << ""
+			", \"text\": \"" << rssl_err.text << "\""
+			" }";
+		return false;
+	}
+
+/* Log connected infrastructure. */
+	std::stringstream components;
+	for (unsigned i = 0; i < info.componentInfoCount; ++i) {
+		if (i > 0) components << ", ";
+		components << "{ "
+			"\"" << info.componentInfo[i]->componentVersion.data << "\""
+			" }";
+	}
+
+/* Relog negotiated state. */
+	std::stringstream client_hostname, client_ip;
+	if (nullptr == handle_->clientHostname) 
+		client_hostname << "null";
+	else	
+		client_hostname << '"' << handle_->clientHostname << '"';
+	if (nullptr == handle_->clientIP)	
+		client_ip << "null";
+	else	
+		client_ip << '"' << handle_->clientIP << '"';
 	LOG(INFO) << prefix_ <<
-		"RWF: { "
-		  "\"MajorVersion\": " << (unsigned)GetRwfMajorVersion() <<
-		", \"MinorVersion\": " << (unsigned)GetRwfMinorVersion() <<
+		  "RSSL negotiated state: { "
+		  "\"clientHostname\": " << client_hostname.str() << ""
+		", \"clientIP\": " << client_ip.str() << ""
+		", \"connectionType\": \"" << internal::connection_type_string (handle_->connectionType) << "\""
+		", \"majorVersion\": " << (unsigned)GetRwfMajorVersion() << ""
+		", \"minorVersion\": " << (unsigned)GetRwfMinorVersion() << ""
+		", \"pingTimeout\": " << handle_->pingTimeout << ""
+		", \"protocolType\": " << handle_->protocolType << ""
+		", \"socketId\": " << handle_->socketId << ""
+		", \"state\": \"" << internal::channel_state_string (handle_->state) << "\""
 		" }";
+/* Derive expected RSSL ping interval from negotiated timeout. */
+	ping_interval_ = handle_->pingTimeout / 3;
+/* Schedule first RSSL ping. */
+	next_ping_ = last_activity_ + boost::posix_time::seconds (ping_interval_);
+/* Treat connect as first RSSL pong. */
+	next_pong_ = last_activity_ + boost::posix_time::seconds (handle_->pingTimeout);
 	return true;
 }
 
-/* RFA callback entry point.
+/* Propagate close notification to RSSL channel before closing the socket.
  */
-void
-anaguma::client_t::processEvent (
-	const rfa::common::Event& event_
-	)
+bool
+anaguma::client_t::Close()
 {
-	VLOG(1) << event_;
-	cumulative_stats_[CLIENT_PC_RFA_EVENTS_RECEIVED]++;
-	last_activity_ = boost::posix_time::second_clock::universal_time();
-	switch (event_.getType()) {
-	case rfa::sessionLayer::OMMSolicitedItemEventEnum:
-		OnOMMSolicitedItemEvent (static_cast<const rfa::sessionLayer::OMMSolicitedItemEvent&>(event_));
-		break;
-
-	case rfa::sessionLayer::OMMInactiveClientSessionEventEnum:
-		OnOMMInactiveClientSessionEvent(static_cast<const rfa::sessionLayer::OMMInactiveClientSessionEvent&>(event_));
-		break;
-
-        default:
-		cumulative_stats_[CLIENT_PC_RFA_EVENTS_DISCARDED]++;
-		LOG(WARNING) << prefix_ << "Uncaught: " << event_;
-                break;
-        }
+/* client_t exists when client session is active but not necessarily logged in. */
+	if (is_logged_in_) {
+		return SendClose (login_token_,
+				  provider_->GetServiceId(),
+				  RSSL_DMT_LOGIN,
+				  nullptr,
+				  0,
+				  false, /* no AttribInfo in MMT_LOGIN */
+				  RSSL_SC_NONE);
+	} else {
+		return true;
+	}
 }
 
-/* 7.4.7.2 Handling consumer solicited item events.
+/* Returns true if message processed successfully, returns false to abort the connection.
  */
-void
-anaguma::client_t::OnOMMSolicitedItemEvent (
-	const rfa::sessionLayer::OMMSolicitedItemEvent&	item_event
+bool
+anaguma::client_t::OnMsg (
+	const RsslMsg* msg
 	)
 {
-	cumulative_stats_[CLIENT_PC_OMM_SOLICITED_ITEM_EVENTS_RECEIVED]++;
-	const rfa::common::Msg& msg = item_event.getMsg();
-
-	if (msg.isBlank()) {
-		cumulative_stats_[CLIENT_PC_OMM_SOLICITED_ITEM_EVENTS_DISCARDED]++;
-		LOG(WARNING) << prefix_ << "Discarding blank solicited message: " << msg;
-		return;
-	}
-
-	switch (msg.getMsgType()) {
-	case rfa::message::ReqMsgEnum:
-		OnReqMsg (static_cast<const rfa::message::ReqMsg&>(msg), &(item_event.getRequestToken()));
-		break;
+	DCHECK (nullptr != msg);
+	cumulative_stats_[CLIENT_PC_UPA_MSGS_RECEIVED]++;
+	switch (msg->msgBase.msgClass) {
+	case RSSL_MC_REQUEST:
+		return OnRequestMsg (reinterpret_cast<const RsslRequestMsg*> (msg));
+	case RSSL_MC_CLOSE:
+		return OnCloseMsg (reinterpret_cast<const RsslCloseMsg*> (msg));
+	case RSSL_MC_REFRESH:
+	case RSSL_MC_STATUS:
+	case RSSL_MC_UPDATE:
+	case RSSL_MC_ACK:
+	case RSSL_MC_GENERIC:
+	case RSSL_MC_POST:
 	default:
-		cumulative_stats_[CLIENT_PC_OMM_SOLICITED_ITEM_EVENTS_DISCARDED]++;
-		LOG(WARNING) << prefix_ << "Uncaught solicited message: " << msg;
-		break;
+		cumulative_stats_[CLIENT_PC_UPA_MSGS_REJECTED]++;
+		LOG(WARNING) << prefix_ << "Uncaught message: " << msg;
+/* abort connection if status message fails. */
+		return SendClose (msg->msgBase.streamId,
+				  msg->msgBase.msgKey.serviceId,
+				  msg->msgBase.domainType,
+				  msg->msgBase.msgKey.name.data,
+				  msg->msgBase.msgKey.name.length,
+				  true, /* always send AttribInfo */
+				  RSSL_SC_USAGE_ERROR);
 	}
 }
 
-void
-anaguma::client_t::OnReqMsg (
-	const rfa::message::ReqMsg& request_msg,
-	rfa::sessionLayer::RequestToken*const request_token
+/* Returns true if message processed successfully, returns false to abort the connection.
+ */
+bool
+anaguma::client_t::OnRequestMsg (
+	const RsslRequestMsg* request_msg
 	)
 {
 	cumulative_stats_[CLIENT_PC_REQUEST_MSGS_RECEIVED]++;
-	switch (request_msg.getMsgModelType()) {
-	case rfa::rdm::MMT_LOGIN:
-		OnLoginRequest (request_msg, request_token);
-		break;
-	case rfa::rdm::MMT_DIRECTORY:
-		OnDirectoryRequest (request_msg, request_token);
-		break;
-	case rfa::rdm::MMT_DICTIONARY:
-		OnDictionaryRequest (request_msg, request_token);
-		break;
-	case rfa::rdm::MMT_MARKET_PRICE:
-	case rfa::rdm::MMT_MARKET_BY_ORDER:
-	case rfa::rdm::MMT_MARKET_BY_PRICE:
-	case rfa::rdm::MMT_MARKET_MAKER:
-	case rfa::rdm::MMT_SYMBOL_LIST:
-		OnItemRequest (request_msg, request_token);
-		break;
+	switch (request_msg->msgBase.domainType) {
+	case RSSL_DMT_LOGIN:
+		return OnLoginRequest (request_msg);
+	case RSSL_DMT_SOURCE:	/* Directory */
+		return OnDirectoryRequest (request_msg);
+	case RSSL_DMT_DICTIONARY:
+		return OnDictionaryRequest (request_msg);
+	case RSSL_DMT_MARKET_PRICE:
+	case RSSL_DMT_MARKET_BY_ORDER:
+	case RSSL_DMT_MARKET_BY_PRICE:
+	case RSSL_DMT_MARKET_MAKER:
+	case RSSL_DMT_SYMBOL_LIST:
+	case RSSL_DMT_YIELD_CURVE:
+		return OnItemRequest (request_msg);
 	default:
-		cumulative_stats_[CLIENT_PC_REQUEST_MSGS_DISCARDED]++;
-		LOG(WARNING) << prefix_ << "Uncaught: " << request_msg;
-		break;
+		cumulative_stats_[CLIENT_PC_REQUEST_MSGS_REJECTED]++;
+		LOG(WARNING) << prefix_ << "Uncaught request message: " << request_msg;
+/* abort connection if status message fails. */
+		return SendClose (request_msg->msgBase.streamId,
+				  request_msg->msgBase.msgKey.serviceId,
+				  request_msg->msgBase.domainType,
+				  request_msg->msgBase.msgKey.name.data,
+				  request_msg->msgBase.msgKey.name.length,
+				  RSSL_RQMF_MSG_KEY_IN_UPDATES == (request_msg->flags & RSSL_RQMF_MSG_KEY_IN_UPDATES),
+				  RSSL_SC_USAGE_ERROR);
 	}
 }
 
-/* The message model type MMT_LOGIN represents a login request. Specific
+/* 7.3. Perform Login Process.
+ * The message model type MMT_LOGIN represents a login request. Specific
  * information about the user e.g., name,name type, permission information,
  * single open, etc is available from the AttribInfo in the ReqMsg accessible
  * via getAttribInfo(). The Provider is responsible for processing this
@@ -217,89 +259,56 @@ anaguma::client_t::OnReqMsg (
  *
  * RDM 3.4.4 Authentication: multiple logins per client session are not supported.
  */
-void
+bool
 anaguma::client_t::OnLoginRequest (
-	const rfa::message::ReqMsg& login_msg,
-	rfa::sessionLayer::RequestToken*const login_token
+	const RsslRequestMsg* login_msg
 	)
 {
 	cumulative_stats_[CLIENT_PC_MMT_LOGIN_RECEIVED]++;
-/* Pass through RFA validation and report exceptions */
-	uint8_t validation_status = rfa::message::MsgValidationError;
-	try {
-/* 4.2.8 Message Validation. */
-		RFA_String warningText;
-		validation_status = login_msg.validateMsg (&warningText);
-		cumulative_stats_[CLIENT_PC_MMT_LOGIN_VALIDATED]++;
-		if (rfa::message::MsgValidationWarning == validation_status)
-			LOG(WARNING) << prefix_ << "MMT_LOGIN::validateMsg: { \"warningText\": \"" << warningText << "\" }";
-	} catch (const rfa::common::InvalidUsageException& e) {
-		cumulative_stats_[CLIENT_PC_MMT_LOGIN_MALFORMED]++;
-		LOG(WARNING) << prefix_ <<
-			"MMT_LOGIN::InvalidUsageException: { " <<
-			  "\"StatusText\": \"" << e.getStatus().getStatusText() << "\""
-			", " << login_msg <<
-			", \"RequestToken\": " << login_token <<
-			" }";
-	} catch (const std::exception& e) {
-		LOG(ERROR) << prefix_ << "Rfa::Exception: { "
-			"\"What\": \"" << e.what() << "\" }";
-	}
 
-	static const uint8_t streaming_request = rfa::message::ReqMsg::InitialImageFlag | rfa::message::ReqMsg::InterestAfterRefreshFlag;
-	static const uint8_t pause_request     = rfa::message::ReqMsg::PauseFlag;
+	static const uint16_t streaming_request = RSSL_RQMF_STREAMING;
+	static const uint16_t pause_request     = RSSL_RQMF_PAUSE;
 
-	try {
-/* Reject on RFA validation failing. */
-		if (rfa::message::MsgValidationError == validation_status) 
-		{
-			LOG(WARNING) << prefix_ << "Rejecting MMT_LOGIN as RFA validation failed.";
-			RejectLogin (login_msg, login_token);
-			return;
-		}
-
-		const bool is_streaming_request = ((login_msg.getInteractionType() == streaming_request)
-						|| (login_msg.getInteractionType() == (streaming_request | pause_request)));
-		const bool is_pause_request     = (login_msg.getInteractionType() == pause_request);
+	const bool is_streaming_request = ((streaming_request == login_msg->flags)
+					|| ((streaming_request | pause_request) == login_msg->flags));
+	const bool is_pause_request     = (pause_request == login_msg->flags);
 
 /* RDM 3.2.4: All message types except GenericMsg should include an AttribInfo.
  * RFA example code verifies existence of AttribInfo with an assertion.
  */
-		const bool has_attribinfo = (0 != (login_msg.getHintMask() & rfa::message::ReqMsg::AttribInfoFlag));
-		const bool has_name = has_attribinfo && (rfa::message::AttribInfo::NameFlag == (login_msg.getAttribInfo().getHintMask() & rfa::message::AttribInfo::NameFlag));
-		const bool has_nametype = has_attribinfo && (rfa::message::AttribInfo::NameTypeFlag == (login_msg.getAttribInfo().getHintMask() & rfa::message::AttribInfo::NameTypeFlag));
+	const bool has_attribinfo = true;
+	const bool has_name       = has_attribinfo && (RSSL_MKF_HAS_NAME      == (login_msg->msgBase.msgKey.flags & RSSL_MKF_HAS_NAME));
+	const bool has_nametype   = has_attribinfo && (RSSL_MKF_HAS_NAME_TYPE == (login_msg->msgBase.msgKey.flags & RSSL_MKF_HAS_NAME_TYPE));
+
+	LOG(INFO) << prefix_
+		  << "is_streaming_request: " << is_streaming_request
+		<< ", is_pause_request: " << is_pause_request
+		<< ", has_attribinfo: " << has_attribinfo
+		<< ", has_name: " << has_name
+		<< ", has_nametype: " << has_nametype;
 
 /* invalid RDM login. */
-		if ((!is_streaming_request && !is_pause_request)
-			|| !has_attribinfo
-			|| !has_name
-			|| !has_nametype)
-		{
-			cumulative_stats_[CLIENT_PC_MMT_LOGIN_MALFORMED]++;
-			LOG(WARNING) << prefix_ << "Rejecting MMT_LOGIN as RDM validation failed: " << login_msg;
-			RejectLogin (login_msg, login_token);
-		}
-		else
-		{
-			AcceptLogin (login_msg, login_token);
-
-/* save token for closing the session. */
-			login_token_ = login_token;
-			is_logged_in_ = true;
-		}
-/* ignore any error */
-	} catch (const rfa::common::InvalidUsageException& e) {
-		cumulative_stats_[CLIENT_PC_MMT_LOGIN_EXCEPTION]++;
-		LOG(ERROR) << prefix_ <<
-			"MMT_LOGIN::InvalidUsageException: { "
-			   "\"StatusText\": \"" << e.getStatus().getStatusText() << "\""
-			", " << login_msg <<
-			", \"RequestToken\": " << login_token <<
-			" }";
-	} catch (const std::exception& e) {
-		LOG(ERROR) << prefix_ << "Rfa::Exception: { "
-			"\"What\": \"" << e.what() << "\" }";
+	if ((!is_streaming_request && !is_pause_request)
+		|| !has_attribinfo
+		|| !has_name
+		|| !has_nametype)
+	{
+		cumulative_stats_[CLIENT_PC_MMT_LOGIN_MALFORMED]++;
+		LOG(WARNING) << prefix_ << "Rejecting MMT_LOGIN as RDM validation failed: " << login_msg;
+		return RejectLogin (login_msg, login_msg->msgBase.streamId);
 	}
+	else
+	{
+		if (!AcceptLogin (login_msg, login_msg->msgBase.streamId)) {
+/* disconnect on failure. */
+			return false;
+		} else {
+			is_logged_in_ = true;
+			login_token_ = login_msg->msgBase.streamId;
+		}
+	}
+
+	return true;
 }
 
 /** Rejecting Login **
@@ -319,64 +328,113 @@ anaguma::client_t::OnLoginRequest (
  */
 bool
 anaguma::client_t::RejectLogin (
-	const rfa::message::ReqMsg& login_msg,
-	rfa::sessionLayer::RequestToken*const login_token
+	const RsslRequestMsg* login_msg,
+	int32_t login_token
 	)
 {
+#ifndef NDEBUG
+/* Static initialisation sets all fields rather than only the minimal set
+ * required.  Use for debug mode and optimise for release builds.
+ */
+	RsslStatusMsg response = RSSL_INIT_STATUS_MSG;
+	RsslEncodeIterator it = RSSL_INIT_ENCODE_ITERATOR;
+#else
+	RsslStatusMsg response;
+	RsslEncodeIterator it;
+	rsslClearStatusMsg (&response);
+	rsslClearEncodeIterator (&it);
+#endif
+	RsslBuffer* buf;
+	RsslError rssl_err;
+	RsslRet rc;
+
 	VLOG(2) << prefix_ << "Sending MMT_LOGIN rejection.";
 
-/* 7.5.9.1 Create a response message (4.2.2) */
-	auto& response = provider_->response_;
-	response.clear();
-/* 7.5.9.2 Set the message model type of the response. */
-	response.setMsgModelType (rfa::rdm::MMT_LOGIN);
-/* 7.5.9.3 Set response type.  RDM 3.2.2 RespMsg: Status when rejecting login. */
-	response.setRespType (rfa::message::RespMsg::StatusEnum);
+/* Set the message model type. */
+	response.msgBase.domainType = RSSL_DMT_LOGIN;
+/* Set response type. */
+	response.msgBase.msgClass = RSSL_MC_STATUS;
+/* No payload. */
+	response.msgBase.containerType = RSSL_DT_NO_DATA;
+/* Set the login token. */
+	response.msgBase.streamId = login_token;
 
-/* 7.5.9.5 Create or re-use a request attribute object (4.2.4) */
-	auto& attribInfo = provider_->attribInfo_;
-	attribInfo.clear();
-/* RDM 3.2.4 AttribInfo: Name is required, NameType is recommended: default is USER_NAME (1) */
-	attribInfo.setNameType (login_msg.getAttribInfo().getNameType());
-	attribInfo.setName (login_msg.getAttribInfo().getName());
-	response.setAttribInfo (attribInfo);
+/* Item interaction state. */
+	response.state.streamState = RSSL_STREAM_CLOSED;
+/* Data quality state. */
+	response.state.dataState = RSSL_DATA_SUSPECT;
+/* Error code. */
+	response.state.code = RSSL_SC_NOT_ENTITLED; // RSSL_SC_TOO_MANY_ITEMS would be more suitable, but does not follow RDM spec.
+	response.flags |= RSSL_STMF_HAS_STATE;
 
-	auto& status = provider_->status_;
-	status.clear();
-/* Item interaction state: RDM 3.2.2 RespMsg: Closed or ClosedRecover. */
-	status.setStreamState (rfa::common::RespStatus::ClosedEnum);
-/* Data quality state: RDM 3.2.2 RespMsg: Suspect. */
-	status.setDataState (rfa::common::RespStatus::SuspectEnum);
-/* Error code: RDM 3.4.3 Authentication: NotAuthorized. */
-	status.setStatusCode (rfa::common::RespStatus::NotAuthorizedEnum);
-	response.setRespStatus (status);
-
-/* 4.2.8 Message Validation.  RFA provides an interface to verify that
- * constructed messages of these types conform to the Reuters Domain
- * Models as specified in RFA API 7 RDM Usage Guide.
- */
-	uint8_t validation_status = rfa::message::MsgValidationError;
-	try {
-		RFA_String warningText;
-		validation_status = response.validateMsg (&warningText);
-		cumulative_stats_[CLIENT_PC_MMT_LOGIN_RESPONSE_VALIDATED]++;
-		if (rfa::message::MsgValidationWarning == validation_status)
-			LOG(WARNING) << prefix_ << "MMT_LOGIN::validateMsg: { \"warningText\": \"" << warningText << "\" }";
-	} catch (const rfa::common::InvalidUsageException& e) {
-		cumulative_stats_[CLIENT_PC_MMT_LOGIN_RESPONSE_MALFORMED]++;
-		LOG(ERROR) << prefix_ <<
-			"MMT_LOGIN::InvalidUsageException: { " <<
-			   "\"StatusText\": \"" << e.getStatus().getStatusText() << "\""
-			", " << response <<
+	buf = rsslGetBuffer (handle_, MAX_MSG_SIZE, RSSL_FALSE /* not packed */, &rssl_err);
+	if (nullptr == buf) {
+		LOG(ERROR) << prefix_ << "rsslGetBuffer: { "
+			  "\"rsslErrorId\": " << rssl_err.rsslErrorId << ""
+			", \"sysError\": " << rssl_err.sysError << ""
+			", \"text\": \"" << rssl_err.text << "\""
+			", \"size\": " << MAX_MSG_SIZE << ""
+			", \"packedBuffer\": false"
 			" }";
-	} catch (const std::exception& e) {
-		LOG(ERROR) << prefix_ << "Rfa::Exception: { "
-			"\"What\": \"" << e.what() << "\" }";
+		return false;
+	}
+	rc = rsslSetEncodeIteratorBuffer (&it, buf);
+	if (RSSL_RET_SUCCESS != rc) {
+		LOG(ERROR) << prefix_ << "rsslSetEncodeIteratorBuffer: { "
+			  "\"returnCode\": " << static_cast<signed> (rc) << ""
+			", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+			", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+			" }";
+		goto cleanup;
+	}
+	rc = rsslSetEncodeIteratorRWFVersion (&it, GetRwfMajorVersion(), GetRwfMinorVersion());
+	if (RSSL_RET_SUCCESS != rc) {
+		LOG(ERROR) << prefix_ << "rsslSetEncodeIteratorRWFVersion: { "
+			  "\"returnCode\": " << static_cast<signed> (rc) << ""
+			", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+			", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+			", \"majorVersion\": " << static_cast<unsigned> (GetRwfMajorVersion()) << ""
+			", \"minorVersion\": " << static_cast<unsigned> (GetRwfMinorVersion()) << ""
+			" }";
+		goto cleanup;
+	}
+	rc = rsslEncodeMsg (&it, reinterpret_cast<RsslMsg*> (&response));
+	if (RSSL_RET_SUCCESS != rc) {
+		LOG(ERROR) << prefix_ << "rsslEncodeMsg: { "
+			  "\"returnCode\": " << static_cast<signed> (rc) << ""
+			", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+			", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+			" }";
+		goto cleanup;
+	}
+	buf->length = rsslGetEncodedBufferLength (&it);
+	LOG_IF(WARNING, 0 == buf->length) << prefix_ << "rsslGetEncodedBufferLength returned 0.";
+
+/* Message validation: must use ASSERT libraries for error description :/ */
+	if (!rsslValidateMsg (reinterpret_cast<RsslMsg*> (&response))) {
+		cumulative_stats_[CLIENT_PC_MMT_LOGIN_RESPONSE_MALFORMED]++;
+		LOG(ERROR) << prefix_ << "rsslValidateMsg failed.";
+		goto cleanup;
+	} else {
+		cumulative_stats_[CLIENT_PC_MMT_LOGIN_RESPONSE_VALIDATED]++;
+		LOG(INFO) << prefix_ << "rsslValidateMsg succeeded.";
 	}
 
-	Submit (&response, login_token, nullptr);
+	if (!Submit (buf)) {
+		goto cleanup;
+	}
 	cumulative_stats_[CLIENT_PC_MMT_LOGIN_REJECTED]++;
 	return true;
+cleanup:
+	cumulative_stats_[CLIENT_PC_MMT_LOGIN_EXCEPTION]++;
+	if (RSSL_RET_SUCCESS != rsslReleaseBuffer (buf, &rssl_err)) {
+		LOG(WARNING) << prefix_ << "rsslReleaseBuffer: { "
+			  "\"rsslErrorId\": " << rssl_err.rsslErrorId << ""
+			", \"sysError\": " << rssl_err.sysError << ""
+			", \"text\": \"" << rssl_err.text << "\""
+			" }";
+	}
+	return false;
 }
 
 /** Accepting Login **
@@ -390,218 +448,312 @@ anaguma::client_t::RejectLogin (
  */
 bool
 anaguma::client_t::AcceptLogin (
-	const rfa::message::ReqMsg& login_msg,
-	rfa::sessionLayer::RequestToken*const login_token
+	const RsslRequestMsg* login_msg,
+	int32_t login_token
 	)
 {
+#ifndef NDEBUG
+	RsslRefreshMsg response = RSSL_INIT_REFRESH_MSG;
+	RsslEncodeIterator it = RSSL_INIT_ENCODE_ITERATOR;
+	RsslElementList	element_list = RSSL_INIT_ELEMENT_LIST;
+	RsslElementEntry element_entry = RSSL_INIT_ELEMENT_ENTRY;
+#else
+	RsslRefreshMsg response;
+	RsslEncodeIterator it;
+	RsslElementList	element_list;
+	RsslElementEntry element_entry;
+	rsslClearRefreshMsg (&response);
+	rsslClearEncodeIterator (&it);
+	rsslClearElementList (&element_list);
+	rsslClearElementEntry (&element_entry);
+#endif
+	RsslBuffer* buf;
+	RsslError rssl_err;
+	RsslRet rc;
+
 	VLOG(2) << prefix_ << "Sending MMT_LOGIN accepted.";
 
-/* 7.5.9.1 Create a response message (4.2.2) */
-	auto& response = provider_->response_;
-	response.clear();
-/* 7.5.9.2 Set the message model type of the response. */
-	response.setMsgModelType (rfa::rdm::MMT_LOGIN);
-/* 7.5.9.3 Set response type.  RDM 3.2.2 RespMsg: Refresh when accepting login. */
-	response.setRespType (rfa::message::RespMsg::RefreshEnum);
-	response.setIndicationMask (rfa::message::RespMsg::RefreshCompleteFlag);
+/* Set the message model type. */
+	response.msgBase.domainType = RSSL_DMT_LOGIN;
+/* Set response type. */
+	response.msgBase.msgClass = RSSL_MC_REFRESH;
+	response.flags = RSSL_RFMF_SOLICITED | RSSL_RFMF_REFRESH_COMPLETE;
+/* No payload. */
+	response.msgBase.containerType = RSSL_DT_NO_DATA;
+/* Set the login token. */
+	response.msgBase.streamId = login_token;
 
-/* 7.5.9.5 Create or re-use a request attribute object (4.2.4) */
-	auto& attribInfo = provider_->attribInfo_;
-	attribInfo.clear();
-/* RDM 3.2.4 AttribInfo: Name is required, NameType is recommended: default is USER_NAME (1) */
-	attribInfo.setNameType (login_msg.getAttribInfo().getNameType());
-	attribInfo.setName (login_msg.getAttribInfo().getName());
-
-	auto& elementList = provider_->elementList_;
-	elementList.setAssociatedMetaInfo (GetRwfMajorVersion(), GetRwfMinorVersion());
-/* Clear required for SingleWriteIterator state machine. */
-	auto& it = provider_->element_it_;
-	DCHECK (it.isInitialized());
-	it.clear();
-	it.start (elementList);
+/* In RFA lingo an attribute object */
+	response.msgBase.msgKey.nameType = login_msg->msgBase.msgKey.nameType;
+	response.msgBase.msgKey.name.data = login_msg->msgBase.msgKey.name.data;
+	response.msgBase.msgKey.name.length = login_msg->msgBase.msgKey.name.length;
+	response.msgBase.msgKey.flags = RSSL_MKF_HAS_NAME_TYPE | RSSL_MKF_HAS_NAME;
+	response.flags |= RSSL_RFMF_HAS_MSG_KEY;
 
 /* RDM 3.3.2 Login Response Elements */
-	rfa::data::ElementEntry entry (false);
-/* Reflect back DACS authentication parameters. */
-	if (login_msg.getAttribInfo().getHintMask() & rfa::message::AttribInfo::AttribFlag)
-	{
-/* RDM Table 52: RFA will raise a warning if request & reponse differ. */
+	response.msgBase.msgKey.attribContainerType = RSSL_DT_ELEMENT_LIST;
+	response.msgBase.msgKey.flags |= RSSL_MKF_HAS_ATTRIB;
+
+/* Item interaction state. */
+	response.state.streamState = RSSL_STREAM_OPEN;
+/* Data quality state. */
+	response.state.dataState = RSSL_DATA_OK;
+/* Error code. */
+	response.state.code = RSSL_SC_NONE;
+
+	buf = rsslGetBuffer (handle_, MAX_MSG_SIZE, RSSL_FALSE /* not packed */, &rssl_err);
+	if (nullptr == buf) {
+		LOG(ERROR) << prefix_ << "rsslGetBuffer: { "
+			  "\"rsslErrorId\": " << rssl_err.rsslErrorId << ""
+			", \"sysError\": " << rssl_err.sysError << ""
+			", \"text\": \"" << rssl_err.text << "\""
+			", \"size\": " << MAX_MSG_SIZE << ""
+			", \"packedBuffer\": false"
+			" }";
+		return false;
+	}	
+	rc = rsslSetEncodeIteratorBuffer (&it, buf);
+	if (RSSL_RET_SUCCESS != rc) {
+		LOG(ERROR) << prefix_ << "rsslSetEncodeIteratorBuffer: { "
+			  "\"returnCode\": " << static_cast<signed> (rc) << ""
+			", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+			", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+			" }";
+		goto cleanup;
 	}
+	rc = rsslSetEncodeIteratorRWFVersion (&it, GetRwfMajorVersion(), GetRwfMinorVersion());
+	if (RSSL_RET_SUCCESS != rc) {
+		LOG(ERROR) << prefix_ << "rsslSetEncodeIteratorRWFVersion: { "
+			  "\"returnCode\": " << static_cast<signed> (rc) << ""
+			", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+			", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+			", \"majorVersion\": " << static_cast<unsigned> (GetRwfMajorVersion()) << ""
+			", \"minorVersion\": " << static_cast<unsigned> (GetRwfMinorVersion()) << ""
+			" }";
+		goto cleanup;
+	}
+	rc = rsslEncodeMsgInit (&it, reinterpret_cast<RsslMsg*> (&response), MAX_MSG_SIZE);
+	if (RSSL_RET_ENCODE_MSG_KEY_OPAQUE != rc) {
+		LOG(ERROR) << prefix_ << "rsslEncodeMsgInit: { "
+			  "\"returnCode\": " << static_cast<signed> (rc) << ""
+			", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+			", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+			", \"dataMaxSize\": " << MAX_MSG_SIZE << ""
+			" }";
+		goto cleanup;
+	}
+
+/* Encode attribute object after message instead of before as per RFA. */
+	element_list.flags = RSSL_ELF_HAS_STANDARD_DATA;
+	rc = rsslEncodeElementListInit (&it, &element_list, nullptr /* element id dictionary */, 4 /* count of elements */);
+	if (RSSL_RET_SUCCESS != rc) {
+		LOG(ERROR) << prefix_ << "rsslEncodeElementListInit: { "
+			  "\"returnCode\": " << static_cast<signed> (rc) << ""
+			", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+			", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+			", \"flags\": \"RSSL_ELF_HAS_STANDARD_DATA\""
+			" }";
+		goto cleanup;
+	}
+
 /* Images and & updates could be stale. */
-	entry.setName (rfa::rdm::ENAME_ALLOW_SUSPECT_DATA);
-	it.bind (entry);
-	it.setUInt (1);
+	static const uint64_t allow_suspect_data = 1;
+	element_entry.dataType	= RSSL_DT_UINT;
+	element_entry.name	= RSSL_ENAME_ALLOW_SUSPECT_DATA;
+	rc = rsslEncodeElementEntry (&it, &element_entry, &allow_suspect_data);
+	if (RSSL_RET_SUCCESS != rc) {
+		LOG(ERROR) << prefix_ << "rsslEncodeElementEntry: { "
+			  "\"returnCode\": " << static_cast<signed> (rc) << ""
+			", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+			", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+			", \"name\": \"RSSL_ENAME_ALLOW_SUSPECT_DATA\""
+			", \"dataType\": \"" << rsslDataTypeToString (element_entry.dataType) << "\""
+			", \"allowSuspectData\": " << allow_suspect_data << ""
+			" }";
+		return false;
+	}
 /* No permission expressions. */
-	entry.setName (rfa::rdm::ENAME_PROV_PERM_EXP);
-	it.bind (entry);
-	it.setUInt (0);
+	static const uint64_t provide_permission_expressions = 0;
+	element_entry.dataType	= RSSL_DT_UINT;
+	element_entry.name	= RSSL_ENAME_PROV_PERM_EXP;
+	rc = rsslEncodeElementEntry (&it, &element_entry, &provide_permission_expressions);
+	if (RSSL_RET_SUCCESS != rc) {
+		LOG(ERROR) << prefix_ << "rsslEncodeElementEntry: { "
+			  "\"returnCode\": " << static_cast<signed> (rc) << ""
+			", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+			", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+			", \"name\": \"RSSL_ENAME_PROV_PERM_EXP\""
+			", \"dataType\": \"" << rsslDataTypeToString (element_entry.dataType) << "\""
+			", \"providePermissionExpressions\": " << provide_permission_expressions << ""
+			" }";
+		goto cleanup;
+	}
 /* No permission profile. */
-	entry.setName (rfa::rdm::ENAME_PROV_PERM_PROF);
-	it.bind (entry);
-	it.setUInt (0);
+	static const uint64_t provide_permission_profile = 0;
+	element_entry.dataType	= RSSL_DT_UINT;
+	element_entry.name	= RSSL_ENAME_PROV_PERM_PROF;
+	rc = rsslEncodeElementEntry (&it, &element_entry, &provide_permission_profile);
+	if (RSSL_RET_SUCCESS != rc) {
+		LOG(ERROR) << prefix_ << "rsslEncodeElementEntry: { "
+			  "\"returnCode\": " << static_cast<signed> (rc) << ""
+			", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+			", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+			", \"name\": \"RSSL_ENAME_PROV_PERM_PROF\""
+			", \"dataType\": \"" << rsslDataTypeToString (element_entry.dataType) << "\""
+			", \"providePermissionProfile\": " << provide_permission_profile << ""
+			" }";
+		goto cleanup;
+	}
 /* Downstream application drives stream recovery. */
-	entry.setName (rfa::rdm::ENAME_SINGLE_OPEN);
-	it.bind (entry);
-	it.setUInt (0);
+	static const uint64_t single_open = 0;
+	element_entry.dataType	= RSSL_DT_UINT;
+	element_entry.name	= RSSL_ENAME_SINGLE_OPEN;
+	rc = rsslEncodeElementEntry (&it, &element_entry, &single_open);
+	if (RSSL_RET_SUCCESS != rc) {
+		LOG(ERROR) << prefix_ << "rsslEncodeElementEntry: { "
+			  "\"returnCode\": " << static_cast<signed> (rc) << ""
+			", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+			", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+			", \"name\": \"RSSL_ENAME_SINGLE_OPEN\""
+			", \"dataType\": \"" << rsslDataTypeToString (element_entry.dataType) << "\""
+			", \"singleOpen\": " << single_open << ""
+			" }";
+		goto cleanup;
+	}
 /* Batch requests not supported. */
 /* OMM posts not supported. */
 /* Optimized pause and resume not supported. */
 /* Views not supported. */
 /* Warm standby not supported. */
 /* Binding complete. */
-	it.complete();
-	attribInfo.setAttrib (elementList);
-	response.setAttribInfo (attribInfo);
-
-	auto& status = provider_->status_;
-	status.clear();
-/* Item interaction state: RDM 3.2.2 RespMsg: Open. */
-	status.setStreamState (rfa::common::RespStatus::OpenEnum);
-/* Data quality state: RDM 3.2.2 RespMsg: Ok. */
-	status.setDataState (rfa::common::RespStatus::OkEnum);
-/* Error code: RDM 3.2.2 RespMsg: None. */
-	status.setStatusCode (rfa::common::RespStatus::NoneEnum);
-	response.setRespStatus (status);
-
-/* 4.2.8 Message Validation.  RFA provides an interface to verify that
- * constructed messages of these types conform to the Reuters Domain
- * Models as specified in RFA API 7 RDM Usage Guide.
- */
-	uint8_t validation_status = rfa::message::MsgValidationError;
-	try {
-		RFA_String warningText;
-		validation_status = response.validateMsg (&warningText);
-		cumulative_stats_[CLIENT_PC_MMT_LOGIN_RESPONSE_VALIDATED]++;
-		if (rfa::message::MsgValidationWarning == validation_status)
-			LOG(WARNING) << prefix_ << "MMT_LOGIN::validateMsg: { \"warningText\": \"" << warningText << "\" }";
-	} catch (const rfa::common::InvalidUsageException& e) {
-		cumulative_stats_[CLIENT_PC_MMT_LOGIN_RESPONSE_MALFORMED]++;
-		LOG(ERROR) << prefix_ <<
-			"MMT_LOGIN::InvalidUsageException: { " <<
-			   "\"StatusText\": \"" << e.getStatus().getStatusText() << "\""
-			", " << response <<
+	rc = rsslEncodeElementListComplete (&it, RSSL_TRUE /* commit */);
+	if (RSSL_RET_SUCCESS != rc) {
+		LOG(ERROR) << prefix_ << "rsslEncodeElementListComplete: { "
+			  "\"returnCode\": " << static_cast<signed> (rc) << ""
+			", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+			", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
 			" }";
-	} catch (const std::exception& e) {
-		LOG(ERROR) << prefix_ << "Rfa::Exception: { "
-			"\"What\": \"" << e.what() << "\" }";
+		goto cleanup;
 	}
+	rc = rsslEncodeMsgKeyAttribComplete (&it, RSSL_TRUE /* commit */);
+	if (RSSL_RET_SUCCESS != rc) {
+		LOG(ERROR) << prefix_ << "rsslEncodeMsgKeyAttribComplete: { "
+			  "\"returnCode\": " << static_cast<signed> (rc) << ""
+			", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+			", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+			" }";
+		goto cleanup;
+	}
+	if (RSSL_RET_SUCCESS != rsslEncodeMsgComplete (&it, RSSL_TRUE /* commit */)) {
+		LOG(ERROR) << prefix_ << "rsslEncodeMsgComplete: { "
+			  "\"returnCode\": " << static_cast<signed> (rc) << ""
+			", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+			", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+			" }";
+		goto cleanup;
+	}
+	buf->length = rsslGetEncodedBufferLength (&it);
+	LOG_IF(WARNING, 0 == buf->length) << prefix_ << "rsslGetEncodedBufferLength returned 0.";
 
-	Submit (&response, login_token, nullptr);
+/* Message validation: must use ASSERT libraries for error description :/ */
+//	if (!rsslValidateMsg (reinterpret_cast<RsslMsg*> (&response))) {
+//		cumulative_stats_[CLIENT_PC_MMT_LOGIN_RESPONSE_MALFORMED]++;
+//		LOG(ERROR) << prefix_ << "rsslValidateMsg failed.";
+//		goto cleanup;
+//	} else {
+//		cumulative_stats_[CLIENT_PC_MMT_LOGIN_RESPONSE_VALIDATED]++;
+//		LOG(INFO) << prefix_ << "rsslValidateMsg succeeded.";
+//	}
+
+	if (!Submit (buf)) {
+		goto cleanup;
+	}
 	cumulative_stats_[CLIENT_PC_MMT_LOGIN_ACCEPTED]++;
 	return true;
+cleanup:
+	cumulative_stats_[CLIENT_PC_MMT_LOGIN_EXCEPTION]++;
+	if (RSSL_RET_SUCCESS != rsslReleaseBuffer (buf, &rssl_err)) {
+		LOG(WARNING) << prefix_ << "rsslReleaseBuffer: { "
+			  "\"rsslErrorId\": " << rssl_err.rsslErrorId << ""
+			", \"sysError\": " << rssl_err.sysError << ""
+			", \"text\": \"" << rssl_err.text << "\""
+			" }";
+	}
+	return false;
 }
 
-/* RDM 4.2.1 ReqMsg
+/* 7.4. Provide Source Directory Information.
+ * RDM 4.2.1 ReqMsg
  * Streaming request or Nonstreaming request. No special semantics or
  * restrictions. Pause request is not supported.
  */
-void
+bool
 anaguma::client_t::OnDirectoryRequest (
-	const rfa::message::ReqMsg& request_msg,
-	rfa::sessionLayer::RequestToken*const request_token
+	const RsslRequestMsg* request_msg
 	)
 {
 	cumulative_stats_[CLIENT_PC_MMT_DIRECTORY_REQUEST_RECEIVED]++;
-/* Pass through RFA validation and report exceptions */
-	uint8_t validation_status = rfa::message::MsgValidationError;
-	try {
-/* 4.2.8 Message Validation. */
-		RFA_String warningText;
-		validation_status = request_msg.validateMsg (&warningText);
-		cumulative_stats_[CLIENT_PC_MMT_DIRECTORY_REQUEST_VALIDATED]++;
-		if (rfa::message::MsgValidationWarning == validation_status)
-			LOG(WARNING) << prefix_ << "MMT_DIRECTORY::validateMsg: { \"warningText\": \"" << warningText << "\" }";
-	} catch (const rfa::common::InvalidUsageException& e) {
-		cumulative_stats_[CLIENT_PC_MMT_DIRECTORY_REQUEST_MALFORMED]++;
-		LOG(WARNING) << prefix_ <<
-			"MMT_DIRECTORY::InvalidUsageException: { " <<
-			  "\"StatusText\": \"" << e.getStatus().getStatusText() << "\""
-			", " << request_msg <<
-			", \"RequestToken\": " << request_token <<
-			" }";
-	} catch (const std::exception& e) {
-		LOG(ERROR) << prefix_ << "Rfa::Exception: { "
-			"\"What\": \"" << e.what() << "\" }";
-	}
 
-	static const uint8_t snapshot_request  = rfa::message::ReqMsg::InitialImageFlag;
-	static const uint8_t streaming_request = snapshot_request | rfa::message::ReqMsg::InterestAfterRefreshFlag;
+	static const uint16_t streaming_request = RSSL_RQMF_STREAMING;
+/* NB: snapshot_request == !streaming_request */
 
-	try {
-/* Reject on RFA validation failing. */
-		if (rfa::message::MsgValidationError == validation_status) 
-		{
-			LOG(WARNING) << prefix_ << "Discarded MMT_DIRECTORY request as RFA validation failed.";
-			return;
-		}
+	const bool is_streaming_request = (streaming_request == request_msg->flags);
+	const bool is_snapshot_request  = !is_streaming_request;
 
 /* RDM 4.2.4 AttribInfo required for ReqMsg. */
-		const bool has_attribinfo = (0 != (request_msg.getHintMask() & rfa::message::ReqMsg::AttribInfoFlag));
-
-		const bool is_snapshot_request  = (request_msg.getInteractionType() == snapshot_request);
-		const bool is_streaming_request = (request_msg.getInteractionType() == streaming_request);
-
-		if ((!is_snapshot_request && !is_streaming_request)
-			|| !has_attribinfo)
-		{
-			cumulative_stats_[CLIENT_PC_MMT_DIRECTORY_MALFORMED]++;
-			LOG(WARNING) << prefix_ << "Discarded MMT_DIRECTORY request as RDM validation failed: " << request_msg;
-			return;
-		}
+	const bool has_attribinfo = true;
 
 /* Filtering of directory contents. */
-		const bool has_datamask = (0 != (request_msg.getAttribInfo().getHintMask() & rfa::message::AttribInfo::DataMaskFlag));
-		const uint32_t filter_mask = has_datamask ? request_msg.getAttribInfo().getDataMask() : UINT32_MAX;
-/* Provides ServiceName */
-		if (0 != (request_msg.getAttribInfo().getHintMask() & rfa::message::AttribInfo::ServiceNameFlag))
-		{
-			const char* service_name = request_msg.getAttribInfo().getServiceName().c_str();
-			SendDirectoryResponse (request_token, service_name, filter_mask);
-		}
-/* Provides ServiceID */
-		else if (0 != (request_msg.getAttribInfo().getHintMask() & rfa::message::AttribInfo::ServiceIDFlag) &&
-			0 != provider_->GetServiceId() /* service id is unknown */)
-		{
-			const uint32_t service_id = request_msg.getAttribInfo().getServiceID();
-			if (service_id == provider_->GetServiceId()) {
-				SendDirectoryResponse (request_token, provider_->GetServiceName(), filter_mask);
-			} else {
+	const bool has_service_name = has_attribinfo && (RSSL_MKF_HAS_NAME       == (request_msg->msgBase.msgKey.flags & RSSL_MKF_HAS_NAME));
+	const bool has_service_id   = has_attribinfo && (RSSL_MKF_HAS_SERVICE_ID == (request_msg->msgBase.msgKey.flags & RSSL_MKF_HAS_SERVICE_ID));
+	const uint32_t filter_mask  = request_msg->msgBase.msgKey.filter;
+
+	const int32_t request_token = request_msg->msgBase.streamId;
+directory_token_ = request_token;
+	if (has_service_name)
+	{
+		const char* service_name = request_msg->msgBase.msgKey.name.data;
+		return SendDirectoryResponse (request_token, service_name, filter_mask);
+	}
+	else if (has_service_id && 0 != request_msg->msgBase.msgKey.serviceId)
+	{
+		const uint16_t service_id = request_msg->msgBase.msgKey.serviceId;
+		if (service_id == provider_->GetServiceId()) {
+			return SendDirectoryResponse (request_token, provider_->GetServiceName(), filter_mask);
+		} else {
 /* default to full directory if id does not match */
-				LOG(WARNING) << prefix_ << "Received MMT_DIRECTORY request for unknown service id #" << service_id << ", returning entire directory.";
-				SendDirectoryResponse (request_token, nullptr, filter_mask);
-			}
+			LOG(WARNING) << prefix_ << "Received MMT_DIRECTORY request for unknown service id #" << service_id << ", returning entire directory.";
+			return SendDirectoryResponse (request_token, nullptr, filter_mask);
 		}
+	}
 /* Provide all services directory. */
-		else
-		{
-			SendDirectoryResponse (request_token, nullptr, filter_mask);
-		}
-/* ignore any error */
-	} catch (const rfa::common::InvalidUsageException& e) {
-		cumulative_stats_[CLIENT_PC_MMT_DIRECTORY_EXCEPTION]++;
-		LOG(ERROR) << prefix_ << "MMT_DIRECTORY::InvalidUsageException: { "
-				"\"StatusText\": \"" << e.getStatus().getStatusText() << "\""
-				" }";
-	} catch (const std::exception& e) {
-		LOG(ERROR) << prefix_ << "Rfa::Exception: { "
-			"\"What\": \"" << e.what() << "\" }";
+	else
+	{
+		return SendDirectoryResponse (request_token, nullptr, filter_mask);
 	}
 }
 
-void
+bool
 anaguma::client_t::OnDictionaryRequest (
-	const rfa::message::ReqMsg&	request_msg,
-	rfa::sessionLayer::RequestToken*const request_token
+	const RsslRequestMsg* request_msg
 	)
 {
 	cumulative_stats_[CLIENT_PC_MMT_DICTIONARY_REQUEST_RECEIVED]++;
 	LOG(INFO) << prefix_ << "DictionaryRequest:" << request_msg;
+
+/* Unsupported for this provider and declared so in the directory. */
+	return SendClose (request_msg->msgBase.streamId,
+			  request_msg->msgBase.msgKey.serviceId,
+			  request_msg->msgBase.domainType,
+			  request_msg->msgBase.msgKey.name.data,
+			  request_msg->msgBase.msgKey.name.length,
+			  RSSL_RQMF_MSG_KEY_IN_UPDATES == (request_msg->flags & RSSL_RQMF_MSG_KEY_IN_UPDATES),
+			  RSSL_SC_USAGE_ERROR);
 }
 
-void
+bool
 anaguma::client_t::OnItemRequest (
-	const rfa::message::ReqMsg&	request_msg,
-	rfa::sessionLayer::RequestToken*const request_token
+	const RsslRequestMsg* request_msg
 	)
 {
 	cumulative_stats_[CLIENT_PC_ITEM_REQUEST_RECEIVED]++;
@@ -612,120 +764,110 @@ anaguma::client_t::OnItemRequest (
  * - Determine whether the requested QoS can be satisified.
  * - Ensure that the same stream is not already provisioned.
  */
-	static const uint8_t streaming_request = rfa::message::ReqMsg::InitialImageFlag | rfa::message::ReqMsg::InterestAfterRefreshFlag;
-	static const uint8_t snapshot_request  = rfa::message::ReqMsg::InitialImageFlag;
-	static const uint8_t pause_request     = rfa::message::ReqMsg::PauseFlag;
-	static const uint8_t resume_request    = rfa::message::ReqMsg::InterestAfterRefreshFlag;
-	static const uint8_t close_request     = 0;
 
 /* A response is not required to be immediately generated, for example
  * forwarding the clients request to an upstream resource and waiting for
  * a reply.
  */
-	try {
-		const uint32_t service_id    = request_msg.getAttribInfo().getServiceID();
-		const uint8_t  model_type    = request_msg.getMsgModelType();
-		const char*    item_name     = request_msg.getAttribInfo().getName().c_str();
-		const size_t   item_name_len = request_msg.getAttribInfo().getName().size();
-		const bool use_attribinfo_in_updates = (0 != (request_msg.getIndicationMask() & rfa::message::ReqMsg::AttribInfoInUpdatesFlag));
+	const uint16_t service_id    = request_msg->msgBase.msgKey.serviceId;
+	const uint8_t  model_type    = request_msg->msgBase.domainType;
+	const char*    item_name     = request_msg->msgBase.msgKey.name.data;
+	const size_t   item_name_len = request_msg->msgBase.msgKey.name.length;
+	const bool use_attribinfo_in_updates = (0 != (request_msg->flags & RSSL_RQMF_MSG_KEY_IN_UPDATES));
 
-		if (!is_logged_in_) {
-			cumulative_stats_[CLIENT_PC_ITEM_REQUEST_REJECTED]++;
-			LOG(INFO) << prefix_ << "Closing request for client without accepted login.";
-			SendClose (request_token, service_id, model_type, item_name, use_attribinfo_in_updates, rfa::common::RespStatus::NotAuthorizedEnum);
-			return;
-		}
-
-/* Only accept MMT_MARKET_PRICE. */
-		if (rfa::rdm::MMT_MARKET_PRICE != model_type)
-		{
-			cumulative_stats_[CLIENT_PC_ITEM_REQUEST_MALFORMED]++;
-			LOG(INFO) << prefix_ << "Closing request for unsupported message model type.";
-			SendClose (request_token, service_id, model_type, item_name, use_attribinfo_in_updates, rfa::common::RespStatus::NotAuthorizedEnum);
-			return;
-		}
-
-		const bool is_streaming_request = (request_msg.getInteractionType() == streaming_request);
 /* 7.4.3.2 Request Tokens
  * Providers should not attempt to submit data after the provider has received a close request for an item. */
-		const bool is_close             = (request_msg.getInteractionType() == close_request);
+	const int32_t request_token = request_msg->msgBase.streamId;
 
-/* capture ServiceID */
-		if (0 == provider_->GetServiceId() &&
-		    0 == request_msg.getAttribInfo().getServiceName().compareCase (provider_->GetServiceName()))
-		{
-			LOG(INFO) << prefix_ << "Detected service id #" << service_id << " for \"" << provider_->GetServiceName() << "\".";
-			provider_->SetServiceId (service_id);
-		}
+	if (!is_logged_in_) {
+		cumulative_stats_[CLIENT_PC_ITEM_REQUEST_REJECTED]++;
+		cumulative_stats_[CLIENT_PC_ITEM_REQUEST_BEFORE_LOGIN]++;
+		LOG(INFO) << prefix_ << "Closing request for client without accepted login.";
+		return SendClose (request_token, service_id, model_type, item_name, item_name_len, use_attribinfo_in_updates, RSSL_SC_USAGE_ERROR);
+	}
 
-		if (is_close)
-		{
-			if (!provider_->RemoveRequest (request_token))
-			{
-				cumulative_stats_[CLIENT_PC_ITEM_REQUEST_DISCARDED]++;
-				LOG(INFO) << prefix_ << "Discarding close request on closed item.";
-			}
-			else
-			{		
-				cumulative_stats_[CLIENT_PC_ITEM_CLOSED]++;
-				DLOG(INFO) << prefix_ << "Closing open request.";
-			}
-		}
-		else if (is_streaming_request)
-		{
-			OnItemStreamingRequest (request_msg, request_token);
-		}
-		else
-		{
-			OnItemSnapshotRequest (request_msg, request_token);
-		}
-
-/* ignore any error */
-	} catch (const rfa::common::InvalidUsageException& e) {
-		cumulative_stats_[CLIENT_PC_ITEM_EXCEPTION]++;
-		LOG(ERROR) << prefix_ << "InvalidUsageException: { "
-				   "\"StatusText\": \"" << e.getStatus().getStatusText() << "\"" <<
-				", " << request_msg <<
-				", \"RequestToken\": " << request_token <<
-				" }";
-	} catch (const std::exception& e) {
-		LOG(ERROR) << prefix_ << "Rfa::Exception: { "
-			"\"What\": \"" << e.what() << "\""
-			" }";
+{
+	std::string ric (item_name, item_name_len);
+	if (0 == ric.compare ("DOWN")) {
+		LOG(INFO) << "Setting DOWN ...";
+		provider_->service_state_ = RDM_DIRECTORY_SERVICE_STATE_DOWN;
+		for (auto it = provider_->clients_.begin(); it != provider_->clients_.end(); ++it) {
+			auto client = it->second;
+			client->SendDirectoryUpdate (provider_->GetServiceName());
+		}		
+		return SendClose (request_token, service_id, model_type, item_name, item_name_len, use_attribinfo_in_updates, RSSL_SC_NOT_ENTITLED);
+	}
+	if (0 == ric.compare ("UP")) {
+		provider_->service_state_ = RDM_DIRECTORY_SERVICE_STATE_UP;
+		LOG(INFO) << "Setting UP ...";
+		for (auto it = provider_->clients_.begin(); it != provider_->clients_.end(); ++it) {
+			auto client = it->second;
+			client->SendDirectoryUpdate (provider_->GetServiceName());
+		}		
+		return SendClose (request_token, service_id, model_type, item_name, item_name_len, use_attribinfo_in_updates, RSSL_SC_NOT_ENTITLED);
 	}
 }
 
-void
+/* Only accept MMT_MARKET_PRICE. */
+	if (RSSL_DMT_MARKET_PRICE != model_type)
+	{
+		cumulative_stats_[CLIENT_PC_ITEM_REQUEST_REJECTED]++;
+		cumulative_stats_[CLIENT_PC_ITEM_REQUEST_MALFORMED]++;
+		LOG(INFO) << prefix_ << "Closing request for unsupported message model type.";
+		return SendClose (request_token, service_id, model_type, item_name, item_name_len, use_attribinfo_in_updates, RSSL_SC_NOT_ENTITLED);
+	}
+
+	const bool is_streaming_request = (RSSL_RQMF_STREAMING == (request_msg->flags & RSSL_RQMF_STREAMING));
+
+	if (is_streaming_request)
+	{
+		return OnItemStreamingRequest (request_msg, request_token);
+	}
+	else
+	{
+		return OnItemSnapshotRequest (request_msg, request_token);
+	}
+}
+
+/* If supported: CLIENT_PC_ITEM_DUPLICATE_SNAPSHOT
+ */
+bool
 anaguma::client_t::OnItemSnapshotRequest (
-	const rfa::message::ReqMsg&	request_msg,
-	rfa::sessionLayer::RequestToken*const request_token
+	const RsslRequestMsg* request_msg,
+	int32_t request_token
 	)
 {
-	const uint32_t service_id    = request_msg.getAttribInfo().getServiceID();
-	const uint8_t  model_type    = request_msg.getMsgModelType();
-	const char*    item_name     = request_msg.getAttribInfo().getName().c_str();
-	const bool use_attribinfo_in_updates = (0 != (request_msg.getIndicationMask() & rfa::message::ReqMsg::AttribInfoInUpdatesFlag));
+	cumulative_stats_[CLIENT_PC_ITEM_SNAPSHOT_REQUEST_RECEIVED]++;
+
+	const uint16_t service_id    = request_msg->msgBase.msgKey.serviceId;
+	const uint8_t  model_type    = request_msg->msgBase.domainType;
+	const char*    item_name     = request_msg->msgBase.msgKey.name.data;
+	const size_t   item_name_len = request_msg->msgBase.msgKey.name.length;
+	const bool use_attribinfo_in_updates = (0 != (request_msg->flags & RSSL_RQMF_MSG_KEY_IN_UPDATES));
 
 /* closest equivalent to not-supported is NotAuthorizedEnum. */
 	cumulative_stats_[CLIENT_PC_ITEM_REQUEST_REJECTED]++;
+	cumulative_stats_[CLIENT_PC_ITEM_REQUEST_MALFORMED]++;
 	LOG(INFO) << prefix_ << "Rejecting unsupported snapshot request.";
-	SendClose (request_token, service_id, model_type, item_name, use_attribinfo_in_updates, rfa::common::RespStatus::NotAuthorizedEnum);
+	return SendClose (request_token, service_id, model_type, item_name, item_name_len, use_attribinfo_in_updates, RSSL_SC_NOT_ENTITLED);
 }
 
-void
+bool
 anaguma::client_t::OnItemStreamingRequest (
-	const rfa::message::ReqMsg&	request_msg,
-	rfa::sessionLayer::RequestToken*const request_token
+	const RsslRequestMsg* request_msg,
+	int32_t request_token
 	)
 {
-	const uint32_t service_id    = request_msg.getAttribInfo().getServiceID();
-	const uint8_t  model_type    = request_msg.getMsgModelType();
-	const char*    item_name     = request_msg.getAttribInfo().getName().c_str();
-	const size_t   item_name_len = request_msg.getAttribInfo().getName().size();
-	const bool use_attribinfo_in_updates = (0 != (request_msg.getIndicationMask() & rfa::message::ReqMsg::AttribInfoInUpdatesFlag));
+	cumulative_stats_[CLIENT_PC_ITEM_STREAMING_REQUEST_RECEIVED]++;
+
+	const uint16_t service_id    = request_msg->msgBase.msgKey.serviceId;
+	const uint8_t  model_type    = request_msg->msgBase.domainType;
+	const char*    item_name     = request_msg->msgBase.msgKey.name.data;
+	const size_t   item_name_len = request_msg->msgBase.msgKey.name.length;
+	const bool use_attribinfo_in_updates = (0 != (request_msg->flags & RSSL_RQMF_MSG_KEY_IN_UPDATES));
 
 /* decompose request */
-	DVLOG(4) << prefix_ << "item name: [" << item_name << "] len: " << item_name_len;
+	DVLOG(4) << prefix_ << "item name: [" << std::string (item_name, item_name_len) << "] len: " << item_name_len;
 	url_parse::Parsed parsed;
 	url_parse::Component file_name;
 	url_.assign ("vta://localhost");
@@ -734,11 +876,10 @@ anaguma::client_t::OnItemStreamingRequest (
 	if (parsed.path.is_valid())
 		url_parse::ExtractFileName (url_.c_str(), parsed.path, &file_name);
 	if (!file_name.is_valid()) {
-		cumulative_stats_[CLIENT_PC_ITEM_REQUEST_MALFORMED]++;
 		cumulative_stats_[CLIENT_PC_ITEM_REQUEST_REJECTED]++;
-		LOG(INFO) << prefix_ << "Closing invalid request for \"" << item_name << "\"";
-		SendClose (request_token, service_id, model_type, item_name, use_attribinfo_in_updates, rfa::common::RespStatus::NotFoundEnum);
-		return;
+		cumulative_stats_[CLIENT_PC_ITEM_REQUEST_MALFORMED]++;
+		LOG(INFO) << prefix_ << "Closing invalid request for \"" << std::string (item_name, item_name_len) << "\"";
+		return SendClose (request_token, service_id, model_type, item_name, item_name_len, use_attribinfo_in_updates, RSSL_SC_NOT_ENTITLED);
 	}
 /* require a NULL terminated string */
 	underlying_symbol_.assign (url_.c_str() + file_name.begin, file_name.len);
@@ -775,199 +916,545 @@ anaguma::client_t::OnItemStreamingRequest (
 
 	if (provider_->AddRequest (request_token, shared_from_this()))
 	{
-		SendInitial (service_id,
-			     request_msg.getAttribInfo().getName(), timestamp,
-			     rwf_major_version_,
-			     rwf_minor_version_,
-			     request_token);
+		return SendInitial (service_id, request_token, item_name, item_name_len, timestamp);
 /* wait for close */
 	}
 	else
 	{
 /* Reissue request for secondary subscribers */
-		SendInitial (service_id,
-			     request_msg.getAttribInfo().getName(), timestamp,
-			     rwf_major_version_,
-			     rwf_minor_version_,
-			     request_token);
+		cumulative_stats_[CLIENT_PC_ITEM_REISSUE_REQUEST_RECEIVED]++;
+		return SendInitial (service_id, request_token, item_name, item_name_len, timestamp);
 	}
+}
+
+bool
+anaguma::client_t::OnCloseMsg (
+	const RsslCloseMsg* close_msg
+	)
+{
+	cumulative_stats_[CLIENT_PC_CLOSE_MSGS_RECEIVED]++;
+	switch (close_msg->msgBase.domainType) {
+	case RSSL_DMT_MARKET_PRICE:
+	case RSSL_DMT_MARKET_BY_ORDER:
+	case RSSL_DMT_MARKET_BY_PRICE:
+	case RSSL_DMT_MARKET_MAKER:
+	case RSSL_DMT_SYMBOL_LIST:
+	case RSSL_DMT_YIELD_CURVE:
+		return OnItemClose (close_msg);
+	case RSSL_DMT_LOGIN:
+/* toggle login status. */
+		cumulative_stats_[CLIENT_PC_MMT_LOGIN_CLOSE_RECEIVED]++;
+		if (!is_logged_in_) {
+			cumulative_stats_[CLIENT_PC_CLOSE_MSGS_DISCARDED]++;
+			LOG(WARNING) << prefix_ << "Close on MMT_LOGIN whilst not logged in.";
+		} else {
+			is_logged_in_ = false;
+			login_token_ = 0;
+/* TODO: cleanup client state. */
+			LOG(INFO) << prefix_ << "Client session logged out.";
+		}
+		break;
+	case RSSL_DMT_SOURCE:	/* Directory */
+/* directory subscription maintains no state, close is a no-op. */
+		cumulative_stats_[CLIENT_PC_MMT_DIRECTORY_CLOSE_RECEIVED]++;
+		LOG(INFO) << prefix_ << "Directory closed.";
+		break;
+	case RSSL_DMT_DICTIONARY:
+/* dictionary is unsupported so a usage error. */
+		cumulative_stats_[CLIENT_PC_MMT_DICTIONARY_CLOSE_RECEIVED]++;
+	default:
+		cumulative_stats_[CLIENT_PC_CLOSE_MSGS_DISCARDED]++;
+		LOG(WARNING) << prefix_ << "Uncaught close message: " << close_msg;
+		break;
+	}
+
+	return true;
+}
+
+bool
+anaguma::client_t::OnItemClose (
+	const RsslCloseMsg* close_msg
+	)
+{
+	cumulative_stats_[CLIENT_PC_ITEM_CLOSE_RECEIVED]++;
+	LOG(INFO) << prefix_ << "ItemClose:" << close_msg;
+
+	const uint16_t service_id    = close_msg->msgBase.msgKey.serviceId;
+	const uint8_t  model_type    = close_msg->msgBase.domainType;
+	const char*    item_name     = close_msg->msgBase.msgKey.name.data;
+	const size_t   item_name_len = close_msg->msgBase.msgKey.name.length;
+/* Close message does not define this flag, go with lowest common denominator. */
+	const bool use_attribinfo_in_updates = true;
+
+/* 7.4.3.2 Request Tokens
+ * Providers should not attempt to submit data after the provider has received a close request for an item. */
+	const int32_t request_token = close_msg->msgBase.streamId;
+
+	if (!is_logged_in_) {
+		cumulative_stats_[CLIENT_PC_CLOSE_MSGS_DISCARDED]++;
+		LOG(INFO) << prefix_ << "Discarding close for client without accepted login.";
+		return true;
+	}
+
+/* Verify domain model */
+	if (RSSL_DMT_MARKET_PRICE != model_type)
+	{
+		cumulative_stats_[CLIENT_PC_CLOSE_MSGS_DISCARDED]++;
+		LOG(INFO) << prefix_ << "Discarding close request for unsupported message model type.";
+		return true;
+	}
+
+	if (!provider_->RemoveRequest (request_token))
+	{
+		cumulative_stats_[CLIENT_PC_CLOSE_MSGS_DISCARDED]++;
+		LOG(INFO) << prefix_ << "Discarding close request on closed item.";
+	}
+	else
+	{		
+		cumulative_stats_[CLIENT_PC_ITEM_CLOSED]++;
+		DLOG(INFO) << prefix_ << "Closed open request.";
+	}
+	return true;
 }
 
 /* Initial images and refresh images for reissue requests.
  */
 bool
 anaguma::client_t::SendInitial (
-	uint32_t service_id,
-	const RFA_String& stream_name,
-	const boost::posix_time::ptime& timestamp,
-	uint8_t rwf_major_version,
-	uint8_t rwf_minor_version,
-	rfa::sessionLayer::RequestToken*const token
+	uint16_t service_id,
+	int32_t token,
+	const char* name,
+	size_t name_len,
+	const boost::posix_time::ptime& timestamp
 	)
 {
 /* 7.4.8.1 Create a response message (4.2.2) */
-	auto& respmsg_ = provider_->response_;
-	respmsg_.clear();
-
-/* 7.4.8.2 Create or re-use a request attribute object (4.2.4) */
-	auto& attribInfo_ = provider_->attribInfo_;
-	attribInfo_.clear();
-	attribInfo_.setNameType (rfa::rdm::INSTRUMENT_NAME_RIC);
-	attribInfo_.setServiceID (service_id);
-	attribInfo_.setName (stream_name);
-	respmsg_.setAttribInfo (attribInfo_);
+	RsslRefreshMsg response = RSSL_INIT_REFRESH_MSG;
+#ifndef NDEBUG
+	RsslEncodeIterator it = RSSL_INIT_ENCODE_ITERATOR;
+#else
+	RsslEncodeIterator it
+	rsslClearEncodeIterator (&it);
+#endif
+	RsslBuffer* buf;
+	RsslError rssl_err;
+	RsslRet rc;
 
 /* 7.4.8.3 Set the message model type of the response. */
-	respmsg_.setMsgModelType (rfa::rdm::MMT_MARKET_PRICE);
+	response.msgBase.domainType = RSSL_DMT_MARKET_PRICE;
 /* 7.4.8.4 Set response type, response type number, and indication mask. */
-	respmsg_.setRespType (rfa::message::RespMsg::RefreshEnum);
-
+	response.msgBase.msgClass = RSSL_MC_REFRESH;
 /* for snapshot images do not cache */
-	respmsg_.setIndicationMask (rfa::message::RespMsg::DoNotFilterFlag     |
-				    rfa::message::RespMsg::RefreshCompleteFlag |
-				    rfa::message::RespMsg::DoNotRippleFlag     |
-				    rfa::message::RespMsg::DoNotCacheFlag);
-/* 4.3.1 RespMsg.Payload */
-// not std::map :(  derived from rfa::common::Data
-	auto& fields_ = provider_->fields_;
-	fields_.setAssociatedMetaInfo (rwf_major_version, rwf_minor_version);
+	response.flags = RSSL_RFMF_SOLICITED        |
+			 RSSL_RFMF_REFRESH_COMPLETE |
+			 RSSL_RFMF_DO_NOT_CACHE;
+/* RDM field list. */
+	response.msgBase.containerType = RSSL_DT_FIELD_LIST;
 
+/* 7.4.8.2 Create or re-use a request attribute object (4.2.4) */
+	response.msgBase.msgKey.serviceId   = service_id;
+	response.msgBase.msgKey.nameType    = RDM_INSTRUMENT_NAME_TYPE_RIC;
+	response.msgBase.msgKey.name.data   = const_cast<char*> (name);
+	response.msgBase.msgKey.name.length = static_cast<uint32_t> (name_len);
+	LOG(INFO) << "data: [" << std::string (name, name_len) << "], length: " << name_len;
+	response.msgBase.msgKey.flags = RSSL_MKF_HAS_SERVICE_ID | RSSL_MKF_HAS_NAME_TYPE | RSSL_MKF_HAS_NAME;
+	response.flags |= RSSL_RFMF_HAS_MSG_KEY;
+/* Set the request token. */
+	response.msgBase.streamId = token;
+
+/** Optional: but require to replace stale values in cache when stale values are supported. **/
+/* Item interaction state: Open, Closed, ClosedRecover, Redirected, NonStreaming, or Unspecified. */
+	response.state.streamState = RSSL_STREAM_OPEN;
+/* Data quality state: Ok, Suspect, or Unspecified. */
+	response.state.dataState = RSSL_DATA_OK;
+/* Error code, e.g. NotFound, InvalidArgument, ... */
+	response.state.code = RSSL_SC_NONE;
+
+	buf = rsslGetBuffer (handle_, MAX_MSG_SIZE, RSSL_FALSE /* not packed */, &rssl_err);
+	if (nullptr == buf) {
+		LOG(ERROR) << prefix_ << "rsslGetBuffer: { "
+			  "\"rsslErrorId\": " << rssl_err.rsslErrorId << ""
+			", \"sysError\": " << rssl_err.sysError << ""
+			", \"text\": \"" << rssl_err.text << "\""
+			", \"size\": " << MAX_MSG_SIZE << ""
+			", \"packedBuffer\": false"
+			" }";
+		return false;
+	}
+	rc = rsslSetEncodeIteratorBuffer (&it, buf);
+	if (RSSL_RET_SUCCESS != rc) {
+		LOG(ERROR) << prefix_ << "rsslSetEncodeIteratorBuffer: { "
+			  "\"returnCode\": " << static_cast<signed> (rc) << ""
+			", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+			", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+			" }";
+		goto cleanup;
+	}
+	rc = rsslSetEncodeIteratorRWFVersion (&it, GetRwfMajorVersion(), GetRwfMinorVersion());
+	if (RSSL_RET_SUCCESS != rc) {
+		LOG(ERROR) << prefix_ << "rsslSetEncodeIteratorRWFVersion: { "
+			  "\"returnCode\": " << static_cast<signed> (rc) << ""
+			", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+			", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+			", \"majorVersion\": " << static_cast<unsigned> (GetRwfMajorVersion()) << ""
+			", \"minorVersion\": " << static_cast<unsigned> (GetRwfMinorVersion()) << ""
+			" }";
+		goto cleanup;
+	}
+	rc = rsslEncodeMsgInit (&it, reinterpret_cast<RsslMsg*> (&response), /* maximum size */ 0);
+	if (RSSL_RET_ENCODE_CONTAINER != rc) {
+		LOG(ERROR) << prefix_ << "rsslEncodeMsgInit: { "
+			  "\"returnCode\": " << static_cast<signed> (rc) << ""
+			", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+			", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+			" }";
+		goto cleanup;
+	}
+	{
+/* 4.3.1 RespMsg.Payload */
 /* TIMEACT & ACTIV_DATE */
-	struct tm _tm;
-	__time32_t time32 = to_unix_epoch<__time32_t> (timestamp);
-	_gmtime32_s (&_tm, &time32);
+		struct tm _tm;
+		__time32_t time32 = to_unix_epoch<__time32_t> (timestamp);
+		_gmtime32_s (&_tm, &time32);
 
 /* Clear required for SingleWriteIterator state machine. */
-	auto& it = provider_->field_it_;
-	DCHECK (it.isInitialized());
-	it.clear();
-	it.start (fields_);
+		RsslFieldList field_list;
+		RsslFieldEntry field;
+		RsslBuffer data_buffer;
+		RsslReal rssl_real;
+		RsslTime rssl_time;
+		RsslDate rssl_date;
+
+		rsslClearFieldList (&field_list);
+		rsslClearFieldEntry (&field);
+		rsslClearReal (&rssl_real);
+
+		field_list.flags = RSSL_FLF_HAS_STANDARD_DATA;
+		rc = rsslEncodeFieldListInit (&it, &field_list, 0 /* summary data */, 0 /* payload */);
+		if (RSSL_RET_SUCCESS != rc) {
+			LOG(ERROR) << prefix_ << "rsslEncodeFieldListInit: { "
+				  "\"returnCode\": " << static_cast<signed> (rc) << ""
+				", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+				", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+				", \"flags\": \"RSSL_FLF_HAS_STANDARD_DATA\""
+				" }";
+			goto cleanup;
+		}
 
 /* For each field set the Id via a FieldEntry bound to the iterator followed by setting the data.
  * The iterator API provides setters for common types excluding 32-bit floats, with fallback to 
  * a generic DataBuffer API for other types or support of pre-calculated values.
  */
-	rfa::data::FieldEntry field (false);
 /* PROD_PERM */
-	field.setFieldID (kRdmProductPermissionId);
-	it.bind (field);
-	const uint64_t prod_perm = 213;		/* for JPY= */
-	it.setUInt (prod_perm);
+		field.fieldId  = kRdmProductPermissionId;
+		field.dataType = RSSL_DT_UINT;
+		const uint64_t prod_perm = 213;		/* for JPY= */
+		rc = rsslEncodeFieldEntry (&it, &field, &prod_perm);
+		if (RSSL_RET_SUCCESS != rc) {
+			LOG(ERROR) << prefix_ << "rsslEncodeFieldEntry: { "
+				  "\"returnCode\": " << static_cast<signed> (rc) << ""
+				", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+				", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+				", \"fieldId\": " << field.fieldId << ""
+				", \"dataType\": \"" << rsslDataTypeToString (field.dataType) << "\""
+				", \"productPermission\": " << prod_perm << ""
+				" }";
+			goto cleanup;
+		}
 
 /* PREF_DISP */
-	field.setFieldID (kRdmPreferredDisplayTemplateId);
-	it.bind (field);
-	const uint32_t pref_disp = 6205;	/* for JPY= */
-	it.setUInt (pref_disp);
+		field.fieldId  = kRdmPreferredDisplayTemplateId;
+		field.dataType = RSSL_DT_UINT;
+		const uint64_t pref_disp = 6205;	/* for JPY= */
+		rc = rsslEncodeFieldEntry (&it, &field, &pref_disp);
+		if (RSSL_RET_SUCCESS != rc) {
+			LOG(ERROR) << prefix_ << "rsslEncodeFieldEntry: { "
+				  "\"returnCode\": " << static_cast<signed> (rc) << ""
+				", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+				", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+				", \"fieldId\": " << field.fieldId << ""
+				", \"dataType\": \"" << rsslDataTypeToString (field.dataType) << "\""
+				", \"preferredDisplayTemplate\": " << pref_disp << ""
+				" }";
+			goto cleanup;
+		}
 
 /* BKGD_REF */
-	field.setFieldID (kRdmBackroundReferenceId);
-	it.bind (field);
-	const RFA_String bkgd_ref ("Japanese Yen", 0, false);
-	it.setString (bkgd_ref, rfa::data::DataBuffer::StringAsciiEnum);
+		field.fieldId  = kRdmBackroundReferenceId;
+		field.dataType = RSSL_DT_ASCII_STRING;
+		const std::string bkgd_ref ("Japanese Yen");
+		data_buffer.data   = const_cast<char*> (bkgd_ref.c_str());
+		data_buffer.length = static_cast<uint32_t> (bkgd_ref.size());
+		rc = rsslEncodeFieldEntry (&it, &field, &data_buffer);
+		if (RSSL_RET_SUCCESS != rc) {
+			LOG(ERROR) << prefix_ << "rsslEncodeFieldEntry: { "
+				  "\"returnCode\": " << static_cast<signed> (rc) << ""
+				", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+				", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+				", \"fieldId\": " << field.fieldId << ""
+				", \"dataType\": \"" << rsslDataTypeToString (field.dataType) << "\""
+				", \"backgroundReference\": \"" << bkgd_ref << "\""
+				" }";
+			goto cleanup;
+		}
 
 /* GV1_TEXT */
-	field.setFieldID (kRdmGeneralText1Id);
-	it.bind (field);
-	const RFA_String gv1_text ("SPOT", 0, false);
-	it.setString (gv1_text, rfa::data::DataBuffer::StringRMTESEnum);
+		field.fieldId  = kRdmGeneralText1Id;
+		field.dataType = RSSL_DT_RMTES_STRING;
+		const std::string gv1_text ("SPOT");
+		data_buffer.data   = const_cast<char*> (gv1_text.c_str());
+		data_buffer.length = static_cast<uint32_t> (gv1_text.size());
+		rc = rsslEncodeFieldEntry (&it, &field, &data_buffer);
+		if (RSSL_RET_SUCCESS != rc) {
+			LOG(ERROR) << prefix_ << "rsslEncodeFieldEntry: { "
+				  "\"returnCode\": " << static_cast<signed> (rc) << ""
+				", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+				", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+				", \"fieldId\": " << field.fieldId << ""
+				", \"dataType\": \"" << rsslDataTypeToString (field.dataType) << "\""
+				", \"generalText1\": \"" << gv1_text << "\""
+				" }";
+			goto cleanup;
+		}
 
 /* GV2_TEXT */
-	field.setFieldID (kRdmGeneralText2Id);
-	it.bind (field);
-	const RFA_String gv2_text ("USDJPY", 0, false);
-	it.setString (gv2_text, rfa::data::DataBuffer::StringRMTESEnum);
+		field.fieldId  = kRdmGeneralText2Id;
+		field.dataType = RSSL_DT_RMTES_STRING;
+		const std::string gv2_text ("USDJPY");
+		data_buffer.data   = const_cast<char*> (gv2_text.c_str());
+		data_buffer.length = static_cast<uint32_t> (gv2_text.size());
+		rc = rsslEncodeFieldEntry (&it, &field, &data_buffer);
+		if (RSSL_RET_SUCCESS != rc) {
+			LOG(ERROR) << prefix_ << "rsslEncodeFieldEntry: { "
+				  "\"returnCode\": " << static_cast<signed> (rc) << ""
+				", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+				", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+				", \"fieldId\": " << field.fieldId << ""
+				", \"dataType\": \"" << rsslDataTypeToString (field.dataType) << "\""
+				", \"generalText2\": \"" << gv2_text << "\""
+				" }";
+			goto cleanup;
+		}
 
 /* PRIMACT_1 */
-	field.setFieldID (kRdmPrimaryActivity1Id);
-	it.bind (field);
-	const double bid = 82.20;
-	it.setReal (worldbank::mantissa (bid), rfa::data::ExponentNeg2);
+		field.fieldId  = kRdmPrimaryActivity1Id;
+		field.dataType = RSSL_DT_REAL;
+		const double bid = 82.20;
+		rssl_real.value = worldbank::mantissa (bid);
+		rssl_real.hint  = RSSL_RH_EXPONENT_2;
+		rc = rsslEncodeFieldEntry (&it, &field, &rssl_real);
+		if (RSSL_RET_SUCCESS != rc) {
+			LOG(ERROR) << prefix_ << "rsslEncodeFieldEntry: { "
+				  "\"returnCode\": " << static_cast<signed> (rc) << ""
+				", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+				", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+				", \"fieldId\": " << field.fieldId << ""
+				", \"dataType\": \"" << rsslDataTypeToString (field.dataType) << "\""
+				", \"primaryActivity1\": { "
+					  "\"isBlank\": " << (rssl_real.isBlank ? "true" : "false") << ""
+					", \"value\": " << rssl_real.value << ""
+					", \"hint\": \"" << internal::real_hint_string (static_cast<RsslRealHints> (rssl_real.hint)) << "\""
+				" }"
+				" }";
+			goto cleanup;
+		}
 
 /* SEC_ACT_1 */
-	field.setFieldID (kRdmSecondActivity1Id);
-	it.bind (field);
-	const double ask = 82.22;
-	it.setReal (worldbank::mantissa (ask), rfa::data::ExponentNeg2);
+		field.fieldId  = kRdmSecondActivity1Id;
+		field.dataType = RSSL_DT_REAL;
+		const double ask = 82.22;
+		rssl_real.value = worldbank::mantissa (ask);
+		rssl_real.hint  = RSSL_RH_EXPONENT_2;
+		rc = rsslEncodeFieldEntry (&it, &field, &rssl_real);
+		if (RSSL_RET_SUCCESS != rc) {
+			LOG(ERROR) << prefix_ << "rsslEncodeFieldEntry: { "
+				  "\"returnCode\": " << static_cast<signed> (rc) << ""
+				", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+				", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+				", \"fieldId\": " << field.fieldId << ""
+				", \"dataType\": \"" << rsslDataTypeToString (field.dataType) << "\""
+				", \"secondActivity1\": { "
+					  "\"isBlank\": " << (rssl_real.isBlank ? "true" : "false") << ""
+					", \"value\": " << rssl_real.value << ""
+					", \"hint\": \"" << internal::real_hint_string (static_cast<RsslRealHints> (rssl_real.hint)) << "\""
+				" }"
+				" }";
+			goto cleanup;
+		}
 
 /* CTBTR_1 */
-	field.setFieldID (kRdmContributor1Id);
-	it.bind (field);
-	const RFA_String ctbtr_1 ("RBS", 0, false);
-	it.setString (ctbtr_1, rfa::data::DataBuffer::StringRMTESEnum);
+		field.fieldId  = kRdmContributor1Id;
+		field.dataType = RSSL_DT_RMTES_STRING;
+		const std::string ctbtr_1 ("RBS");
+		data_buffer.data   = const_cast<char*> (ctbtr_1.c_str());
+		data_buffer.length = static_cast<uint32_t> (ctbtr_1.size());
+		rc = rsslEncodeFieldEntry (&it, &field, &data_buffer);
+		if (RSSL_RET_SUCCESS != rc) {
+			LOG(ERROR) << prefix_ << "rsslEncodeFieldEntry: { "
+				  "\"returnCode\": " << static_cast<signed> (rc) << ""
+				", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+				", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+				", \"fieldId\": " << field.fieldId << ""
+				", \"dataType\": \"" << rsslDataTypeToString (field.dataType) << "\""
+				", \"contributor1\": \"" << ctbtr_1 << "\""
+				" }";
+			goto cleanup;
+		}
 
 /* CTB_LOC1 */
-	field.setFieldID (kRdmContributorLocation1Id);
-	it.bind (field);
-	const RFA_String ctb_loc1 ("XST", 0, false);
-	it.setString (ctb_loc1, rfa::data::DataBuffer::StringRMTESEnum);
+		field.fieldId  = kRdmContributorLocation1Id;
+		field.dataType = RSSL_DT_RMTES_STRING;
+		const std::string ctb_loc1 ("XST");
+		data_buffer.data   = const_cast<char*> (ctb_loc1.c_str());
+		data_buffer.length = static_cast<uint32_t> (ctb_loc1.size());
+		rc = rsslEncodeFieldEntry (&it, &field, &data_buffer);
+		if (RSSL_RET_SUCCESS != rc) {
+			LOG(ERROR) << prefix_ << "rsslEncodeFieldEntry: { "
+				  "\"returnCode\": " << static_cast<signed> (rc) << ""
+				", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+				", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+				", \"fieldId\": " << field.fieldId << ""
+				", \"dataType\": \"" << rsslDataTypeToString (field.dataType) << "\""
+				", \"contributorLocation1\": \"" << ctb_loc1 << "\""
+				" }";
+			goto cleanup;
+		}
 
 /* CTB_PAGE1 */
-	field.setFieldID (kRdmContributorPage1Id);
-	it.bind (field);
-	const RFA_String ctb_page1 ("1RBS", 0, false);
-	it.setString (ctb_page1, rfa::data::DataBuffer::StringRMTESEnum);
+		field.fieldId  = kRdmContributorPage1Id;
+		field.dataType = RSSL_DT_RMTES_STRING;
+		const std::string ctb_page1 ("1RBS");
+		data_buffer.data   = const_cast<char*> (ctb_page1.c_str()); 
+		data_buffer.length = static_cast<uint32_t> (ctb_page1.size());
+		rc = rsslEncodeFieldEntry (&it, &field, &data_buffer);
+		if (RSSL_RET_SUCCESS != rc) {
+			LOG(ERROR) << prefix_ << "rsslEncodeFieldEntry: { "
+				  "\"returnCode\": " << static_cast<signed> (rc) << ""
+				", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+				", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+				", \"fieldId\": " << field.fieldId << ""
+				", \"dataType\": \"" << rsslDataTypeToString (field.dataType) << "\""
+				", \"contributorPage1\": \"" << ctb_page1 << "\""
+				" }";
+			goto cleanup;
+		}
 
 /* DLG_CODE1 */
-	field.setFieldID (kRdmDealingCode1Id);
-	it.bind (field);
-	const RFA_String dlg_code1 ("RBSN", 0, false);
-	it.setString (dlg_code1, rfa::data::DataBuffer::StringRMTESEnum);
+		field.fieldId  = kRdmDealingCode1Id;
+		field.dataType = RSSL_DT_RMTES_STRING;
+		const std::string dlg_code1 ("RBSN");
+		data_buffer.data   = const_cast<char*> (dlg_code1.c_str());
+		data_buffer.length = static_cast<uint32_t> (dlg_code1.size());
+		rc = rsslEncodeFieldEntry (&it, &field, &data_buffer);
+		if (RSSL_RET_SUCCESS != rc) {
+			LOG(ERROR) << prefix_ << "rsslEncodeFieldEntry: { "
+				  "\"returnCode\": " << static_cast<signed> (rc) << ""
+				", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+				", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+				", \"fieldId\": " << field.fieldId << ""
+				", \"dataType\": \"" << rsslDataTypeToString (field.dataType) << "\""
+				", \"dealingCode1\": \"" << dlg_code1 << "\""
+				" }";
+			goto cleanup;
+		}
 
 /* VALUE_TS1 */
-	field.setFieldID (kRdmActivityTime1Id);
-	it.bind (field);
-	it.setTime (_tm.tm_hour, _tm.tm_min, _tm.tm_sec, 0 /* ms */);
+		field.fieldId  = kRdmActivityTime1Id;
+		field.dataType = RSSL_DT_TIME;
+		rssl_time.hour = _tm.tm_hour; rssl_time.minute = _tm.tm_min; rssl_time.second = _tm.tm_sec; rssl_time.millisecond = 0;
+		rc = rsslEncodeFieldEntry (&it, &field, &rssl_time);
+		if (RSSL_RET_SUCCESS != rc) {
+			LOG(ERROR) << "rsslEncodeFieldEntry: { "
+				  "\"returnCode\": " << static_cast<signed> (rc) << ""
+				", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+				", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+				", \"fieldId\": " << field.fieldId << ""
+				", \"dataType\": \"" << rsslDataTypeToString (field.dataType) << "\""
+				", \"activityTime1\": { "
+					  "\"hour\": " << rssl_time.hour << ""
+					", \"minute\": " << rssl_time.minute << ""
+					", \"second\": " << rssl_time.second << ""
+					", \"millisecond\": " << rssl_time.millisecond << ""
+				" }"
+				" }";
+			goto cleanup;
+		}
 
 /* VALUE_DT1 */
-	field.setFieldID (kRdmActivityDate1Id);
-	it.bind (field);
-	const uint16_t year  = /* rfa(yyyy) */ 1900 + _tm.tm_year /* tm(yyyy-1900 */;
-	const uint8_t  month = /* rfa(1-12) */    1 + _tm.tm_mon  /* tm(0-11) */;
-	const uint8_t  day   = /* rfa(1-31) */        _tm.tm_mday /* tm(1-31) */;
-	it.setDate (year, month, day);
+		field.fieldId  = kRdmActivityDate1Id;
+		field.dataType = RSSL_DT_DATE;
+		rssl_date.year  = /* upa(yyyy) */ 1900 + _tm.tm_year /* tm(yyyy-1900 */;
+		rssl_date.month = /* upa(1-12) */    1 + _tm.tm_mon  /* tm(0-11) */;
+		rssl_date.day   = /* upa(1-31) */        _tm.tm_mday /* tm(1-31) */;
+		rc = rsslEncodeFieldEntry (&it, &field, &rssl_date);
+		if (RSSL_RET_SUCCESS != rc) {
+			LOG(ERROR) << prefix_ << "rsslEncodeFieldEntry: { "
+				  "\"returnCode\": " << static_cast<signed> (rc) << ""
+				", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+				", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+				", \"fieldId\": " << field.fieldId << ""
+				", \"dataType\": \"" << rsslDataTypeToString (field.dataType) << "\""
+				", \"activityDate1\": { "
+					  "\"year\": " << rssl_date.year << ""
+					", \"month\": " << rssl_date.month << ""
+					", \"day\": " << rssl_date.day << ""
+				" }"
+				" }";
+			goto cleanup;
+		}
 
-	it.complete();
-	respmsg_.setPayload (fields_);
-
-/** Optional: but require to replace stale values in cache when stale values are supported. **/
-	auto& status_ = provider_->status_;
-	status_.clear();
-/* Item interaction state: Open, Closed, ClosedRecover, Redirected, NonStreaming, or Unspecified. */
-	status_.setStreamState (rfa::common::RespStatus::OpenEnum);
-/* Data quality state: Ok, Suspect, or Unspecified. */
-	status_.setDataState (rfa::common::RespStatus::OkEnum);
-/* Error code, e.g. NotFound, InvalidArgument, ... */
-	status_.setStatusCode (rfa::common::RespStatus::NoneEnum);
-	respmsg_.setRespStatus (status_);
+		rc = rsslEncodeFieldListComplete (&it, RSSL_TRUE /* commit */);
+		if (RSSL_RET_SUCCESS != rc) {
+			LOG(ERROR) << prefix_ << "rsslEncodeFieldListComplete: { "
+				  "\"returnCode\": " << static_cast<signed> (rc) << ""
+				", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+				", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+				" }";
+			goto cleanup;
+		}
+	}
+/* finalize multi-step encoder */
+	rc = rsslEncodeMsgComplete (&it, RSSL_TRUE /* commit */);
+	if (RSSL_RET_SUCCESS != rc) {
+		LOG(ERROR) << prefix_ << "rsslEncodeMsgComplete: { "
+			  "\"returnCode\": " << static_cast<signed> (rc) << ""
+			", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+			", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+			" }";
+		goto cleanup;
+	}
+	buf->length = rsslGetEncodedBufferLength (&it);
+	LOG_IF(WARNING, 0 == buf->length) << prefix_ << "rsslGetEncodedBufferLength returned 0.";
 
 	if (DCHECK_IS_ON()) {
-/* 4.2.8 Message Validation.  RFA provides an interface to verify that
- * constructed messages of these types conform to the Reuters Domain
- * Models as specified in RFA API 7 RDM Usage Guide.
- */
-		uint8_t validation_status = rfa::message::MsgValidationError;
-		try {
-			RFA_String warningText;
-			validation_status = respmsg_.validateMsg (&warningText);
-			if (rfa::message::MsgValidationWarning == validation_status)
-				LOG(ERROR) << prefix_ << "validateMsg: { \"warningText\": \"" << warningText << "\" }";
-		} catch (const rfa::common::InvalidUsageException& e) {
-			LOG(ERROR) << prefix_ << "InvalidUsageException: { " <<
-					   "\"StatusText\": \"" << e.getStatus().getStatusText() << "\""
-					", " << respmsg_ <<
-				      " }";
-		} catch (const std::exception& e) {
-			LOG(ERROR) << prefix_<< "Rfa::Exception: { "
-				"\"What\": \"" << e.what() << "\" }";
+/* Message validation: must use ASSERT libraries for error description :/ */
+		if (!rsslValidateMsg (reinterpret_cast<RsslMsg*> (&response))) {
+			cumulative_stats_[CLIENT_PC_ITEM_MALFORMED]++;
+			LOG(ERROR) << prefix_ << "rsslValidateMsg failed.";
+			goto cleanup;
+		} else {
+			cumulative_stats_[CLIENT_PC_ITEM_VALIDATED]++;
+			LOG(INFO) << prefix_ << "rsslValidateMsg succeeded.";
 		}
 	}
 
-	Submit (&respmsg_, token, nullptr);	
+	if (!Submit (buf)) {
+		goto cleanup;
+	}
 	cumulative_stats_[CLIENT_PC_ITEM_SENT]++;
 	return true;
+cleanup:
+	if (RSSL_RET_SUCCESS != rsslReleaseBuffer (buf, &rssl_err)) {
+		LOG(WARNING) << prefix_ << "rsslReleaseBuffer: { "
+			  "\"rsslErrorId\": " << rssl_err.rsslErrorId << ""
+			", \"sysError\": " << rssl_err.sysError << ""
+			", \"text\": \"" << rssl_err.text << "\""
+			" }";
+	}
+	return false;
 }
 
+#if 0
 /* 7.4.7.1.2 Handling Consumer Client Session Events: Client session connection
  *           has been lost.
  *
@@ -1005,16 +1492,12 @@ anaguma::client_t::OnOMMInactiveClientSessionEvent (
 /* handle is now invalid. */
 		handle_ = nullptr;
 /* ignore any error */
-	} catch (const rfa::common::InvalidUsageException& e) {
-		cumulative_stats_[CLIENT_PC_OMM_INACTIVE_CLIENT_SESSION_EXCEPTION]++;
-		LOG(ERROR) << prefix_ << "OMMInactiveClientSession::InvalidUsageException: { "
-				"\"StatusText\": \"" << e.getStatus().getStatusText() << "\""
-				" }";
 	} catch (const std::exception& e) {
-		LOG(ERROR) << prefix_ << "Rfa::Exception: { "
+		LOG(ERROR) << prefix_ << "Exception: { "
 			"\"What\": \"" << e.what() << "\" }";
 	}
 }
+#endif
 
 /* 10.3.4 Providing Service Directory (Interactive)
  * A Consumer typically requests a Directory from a Provider to retrieve
@@ -1023,138 +1506,438 @@ anaguma::client_t::OnOMMInactiveClientSessionEvent (
  */
 bool
 anaguma::client_t::SendDirectoryResponse (
-	rfa::sessionLayer::RequestToken*const request_token,
+	int32_t request_token,
 	const char* service_name,
 	uint32_t filter_mask
 	)
 {
+/* 7.5.9.1 Create a response message (4.2.2) */
+	RsslRefreshMsg response = RSSL_INIT_REFRESH_MSG;
+#ifndef NDEBUG
+	RsslEncodeIterator it = RSSL_INIT_ENCODE_ITERATOR;
+#else
+	RsslEncodeIterator it
+	rsslClearEncodeIterator (&it);
+#endif
+	RsslBuffer* buf;
+	RsslError rssl_err;
+	RsslRet rc;
+
 	VLOG(2) << prefix_ << "Sending directory response.";
 
-/* 7.5.9.1 Create a response message (4.2.2) */
-	auto& response = provider_->response_;
-	response.clear();
-	provider_->GetDirectoryResponse (&response, GetRwfMajorVersion(), GetRwfMinorVersion(), service_name, filter_mask, rfa::rdm::REFRESH_SOLICITED);
-
-/* 4.2.8 Message Validation.  RFA provides an interface to verify that
- * constructed messages of these types conform to the Reuters Domain
- * Models as specified in RFA API 7 RDM Usage Guide.
+/* 7.5.9.2 Set the message model type of the response. */
+	response.msgBase.domainType = RSSL_DMT_SOURCE;
+/* 7.5.9.3 Set response type. */
+	response.msgBase.msgClass = RSSL_MC_REFRESH;
+/* 7.5.9.4 Set the response type enumeration.
+ * Note type is unsolicited despite being a mandatory requirement before
+ * publishing.
  */
-	uint8_t validation_status = rfa::message::MsgValidationError;
-	try { 
-		RFA_String warningText;
-		validation_status = response.validateMsg (&warningText);
-		cumulative_stats_[CLIENT_PC_MMT_DIRECTORY_VALIDATED]++;
-		if (rfa::message::MsgValidationWarning == validation_status)
-			LOG(ERROR) << prefix_ << "MMT_DIRECTORY::validateMsg: { \"warningText\": \"" << warningText << "\" }";
-	} catch (const rfa::common::InvalidUsageException& e) {
-		cumulative_stats_[CLIENT_PC_MMT_DIRECTORY_MALFORMED]++;
-		LOG(ERROR) << prefix_ <<
-			"MMT_DIRECTORY::InvalidUsageException: { " <<
-			   "\"StatusText\": \"" << e.getStatus().getStatusText() << "\""
-			", " << response <<
+	response.flags = RSSL_RFMF_SOLICITED | RSSL_RFMF_REFRESH_COMPLETE;
+/* Directory map. */
+	response.msgBase.containerType = RSSL_DT_MAP;
+/* DataMask: required for refresh RespMsg
+ *   SERVICE_INFO_FILTER  - Static information about service.
+ *   SERVICE_STATE_FILTER - Refresh or update state.
+ *   SERVICE_GROUP_FILTER - Transient groups within service.
+ *   SERVICE_LOAD_FILTER  - Statistics about concurrent stream support.
+ *   SERVICE_DATA_FILTER  - Broadcast data.
+ *   SERVICE_LINK_FILTER  - Load balance grouping.
+ */
+	response.msgBase.msgKey.filter = filter_mask & (RDM_DIRECTORY_SERVICE_INFO_FILTER | RDM_DIRECTORY_SERVICE_STATE_FILTER);
+/* Name:        Not used */
+/* NameType:    Not used */
+/* ServiceName: Not used */
+/* ServiceId:   Not used */
+/* Id:          Not used */
+/* Attrib:      Not used */
+	response.msgBase.msgKey.flags = RSSL_MKF_HAS_FILTER;
+	response.flags |= RSSL_RFMF_HAS_MSG_KEY;
+/* set token */
+	response.msgBase.streamId = request_token;
+
+/* Item interaction state. */
+	response.state.streamState = RSSL_STREAM_OPEN;
+/* Data quality state. */
+	response.state.dataState = RSSL_DATA_OK;
+/* Error code. */
+	response.state.code = RSSL_SC_NONE;
+
+/* pop buffer from RSSL memory pool */
+	buf = rsslGetBuffer (handle_, MAX_MSG_SIZE, RSSL_FALSE /* not packed */, &rssl_err);
+	if (nullptr == buf) {
+		LOG(ERROR) << prefix_ << "rsslGetBuffer: { "
+			  "\"rsslErrorId\": " << rssl_err.rsslErrorId << ""
+			", \"sysError\": " << rssl_err.sysError << ""
+			", \"text\": \"" << rssl_err.text << "\""
+			", \"size\": " << MAX_MSG_SIZE << ""
+			", \"packedBuffer\": false"
 			" }";
-	} catch (const std::exception& e) {
-		LOG(ERROR) << prefix_ << "Rfa::Exception: { "
-			"\"What\": \"" << e.what() << "\" }";
+		return false;
+	}
+/* tie buffer to RSSL write iterator */
+	rc = rsslSetEncodeIteratorBuffer (&it, buf);
+	if (RSSL_RET_SUCCESS != rc) {
+		LOG(ERROR) << prefix_ << "rsslSetEncodeIteratorBuffer: { "
+			  "\"returnCode\": " << static_cast<signed> (rc) << ""
+			", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+			", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+			" }";
+		goto cleanup;
+	}
+/* encode with clients preferred protocol version */
+	rc = rsslSetEncodeIteratorRWFVersion (&it, GetRwfMajorVersion(), GetRwfMinorVersion());
+	if (RSSL_RET_SUCCESS != rc) {
+		LOG(ERROR) << prefix_ << "rsslSetEncodeIteratorRWFVersion: { "
+			  "\"returnCode\": " << static_cast<signed> (rc) << ""
+			", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+			", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+			", \"majorVersion\": " << static_cast<unsigned> (GetRwfMajorVersion()) << ""
+			", \"minorVersion\": " << static_cast<unsigned> (GetRwfMinorVersion()) << ""
+			" }";
+		goto cleanup;
+	}
+/* start multi-step encoder */
+	rc = rsslEncodeMsgInit (&it, reinterpret_cast<RsslMsg*> (&response), MAX_MSG_SIZE);
+	if (RSSL_RET_ENCODE_CONTAINER != rc) {
+		LOG(ERROR) << prefix_ << "rsslEncodeMsgInit failed: { "
+			  "\"returnCode\": " << static_cast<signed> (rc) << ""
+			", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+			", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+			", \"dataMaxSize\": " << MAX_MSG_SIZE << ""
+			" }";
+		goto cleanup;
+	}
+/* populate directory map */
+	if (!provider_->GetDirectoryMap (&it, service_name, filter_mask, RSSL_MPEA_ADD_ENTRY)) {
+		LOG(ERROR) << prefix_ << "GetDirectoryMap failed.";
+		goto cleanup;
+	}
+/* finalize multi-step encoder */
+	rc = rsslEncodeMsgComplete (&it, RSSL_TRUE /* commit */);
+	if (RSSL_RET_SUCCESS != rc) {
+		LOG(ERROR) << prefix_ << "rsslEncodeMsgComplete: { "
+			  "\"returnCode\": " << static_cast<signed> (rc) << ""
+			", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+			", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+			" }";
+		goto cleanup;
+	}
+	buf->length = rsslGetEncodedBufferLength (&it);
+	LOG_IF(WARNING, 0 == buf->length) << prefix_ << "rsslGetEncodedBufferLength returned 0.";
+
+/* Message validation. */
+	if (!rsslValidateMsg (reinterpret_cast<RsslMsg*> (&response))) {
+		cumulative_stats_[CLIENT_PC_MMT_DIRECTORY_MALFORMED]++;
+		LOG(ERROR) << prefix_ << "rsslValidateMsg failed.";
+		goto cleanup;
+	} else {
+		cumulative_stats_[CLIENT_PC_MMT_DIRECTORY_VALIDATED]++;
+		LOG(INFO) << prefix_ << "rsslValidateMsg succeeded.";
 	}
 
-/* Create and throw away first token for MMT_DIRECTORY. */
-	Submit (&response, request_token, nullptr);
+	if (!Submit (buf)) {
+		LOG(ERROR) << prefix_ << "Submit failed.";
+		goto cleanup;
+	}
 	cumulative_stats_[CLIENT_PC_MMT_DIRECTORY_SENT]++;
 	return true;
+cleanup:
+	if (RSSL_RET_SUCCESS != rsslReleaseBuffer (buf, &rssl_err)) {
+		LOG(WARNING) << prefix_ << "rsslReleaseBuffer: { "
+			  "\"rsslErrorId\": " << rssl_err.rsslErrorId << ""
+			", \"sysError\": " << rssl_err.sysError << ""
+			", \"text\": \"" << rssl_err.text << "\""
+			" }";
+	}
+	return false;
+}
+
+bool
+anaguma::client_t::SendDirectoryUpdate (
+	const char* service_name
+	)
+{
+/* 7.5.9.1 Create a response message (4.2.2) */
+	RsslUpdateMsg response = RSSL_INIT_UPDATE_MSG;
+#ifndef NDEBUG
+	RsslEncodeIterator it = RSSL_INIT_ENCODE_ITERATOR;
+#else
+	RsslEncodeIterator it
+	rsslClearEncodeIterator (&it);
+#endif
+	RsslBuffer* buf;
+	RsslError rssl_err;
+	RsslRet rc;
+
+	VLOG(2) << prefix_ << "Sending directory update.";
+
+/* 7.5.9.2 Set the message model type of the response. */
+	response.msgBase.domainType = RSSL_DMT_SOURCE;
+/* 7.5.9.3 Set response type. */
+	response.msgBase.msgClass = RSSL_MC_UPDATE;
+/* 7.5.9.4 Set the response type enumeration.
+ * Note type is unsolicited despite being a mandatory requirement before
+ * publishing.
+ */
+	response.flags = RSSL_UPMF_DO_NOT_CONFLATE;
+/* Directory map. */
+	response.msgBase.containerType = RSSL_DT_MAP;
+/* DataMask: required for refresh RespMsg
+ *   SERVICE_INFO_FILTER  - Static information about service.
+ *   SERVICE_STATE_FILTER - Refresh or update state.
+ *   SERVICE_GROUP_FILTER - Transient groups within service.
+ *   SERVICE_LOAD_FILTER  - Statistics about concurrent stream support.
+ *   SERVICE_DATA_FILTER  - Broadcast data.
+ *   SERVICE_LINK_FILTER  - Load balance grouping.
+ */
+	response.msgBase.msgKey.filter = RDM_DIRECTORY_SERVICE_STATE_FILTER;
+/* Name:        Not used */
+/* NameType:    Not used */
+/* ServiceName: Not used */
+/* ServiceId:   Not used */
+/* Id:          Not used */
+/* Attrib:      Not used */
+	response.msgBase.msgKey.flags = RSSL_MKF_HAS_FILTER;
+	response.flags |= RSSL_UPMF_HAS_MSG_KEY;
+/* set token */
+	response.msgBase.streamId = directory_token_;
+
+/* pop buffer from RSSL memory pool */
+	buf = rsslGetBuffer (handle_, MAX_MSG_SIZE, RSSL_FALSE /* not packed */, &rssl_err);
+	if (nullptr == buf) {
+		LOG(ERROR) << prefix_ << "rsslGetBuffer: { "
+			  "\"rsslErrorId\": " << rssl_err.rsslErrorId << ""
+			", \"sysError\": " << rssl_err.sysError << ""
+			", \"text\": \"" << rssl_err.text << "\""
+			", \"size\": " << MAX_MSG_SIZE << ""
+			", \"packedBuffer\": false"
+			" }";
+		return false;
+	}
+/* tie buffer to RSSL write iterator */
+	rc = rsslSetEncodeIteratorBuffer (&it, buf);
+	if (RSSL_RET_SUCCESS != rc) {
+		LOG(ERROR) << prefix_ << "rsslSetEncodeIteratorBuffer: { "
+			  "\"returnCode\": " << static_cast<signed> (rc) << ""
+			", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+			", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+			" }";
+		goto cleanup;
+	}
+/* encode with clients preferred protocol version */
+	rc = rsslSetEncodeIteratorRWFVersion (&it, GetRwfMajorVersion(), GetRwfMinorVersion());
+	if (RSSL_RET_SUCCESS != rc) {
+		LOG(ERROR) << prefix_ << "rsslSetEncodeIteratorRWFVersion: { "
+			  "\"returnCode\": " << static_cast<signed> (rc) << ""
+			", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+			", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+			", \"majorVersion\": " << static_cast<unsigned> (GetRwfMajorVersion()) << ""
+			", \"minorVersion\": " << static_cast<unsigned> (GetRwfMinorVersion()) << ""
+			" }";
+		goto cleanup;
+	}
+/* start multi-step encoder */
+	rc = rsslEncodeMsgInit (&it, reinterpret_cast<RsslMsg*> (&response), MAX_MSG_SIZE);
+	if (RSSL_RET_ENCODE_CONTAINER != rc) {
+		LOG(ERROR) << prefix_ << "rsslEncodeMsgInit failed: { "
+			  "\"returnCode\": " << static_cast<signed> (rc) << ""
+			", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+			", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+			", \"dataMaxSize\": " << MAX_MSG_SIZE << ""
+			" }";
+		goto cleanup;
+	}
+/* populate directory map */
+	if (!provider_->GetDirectoryMap (&it, service_name, RDM_DIRECTORY_SERVICE_STATE_FILTER, RSSL_MPEA_UPDATE_ENTRY)) {
+		LOG(ERROR) << prefix_ << "GetDirectoryMap failed.";
+		goto cleanup;
+	}
+/* finalize multi-step encoder */
+	rc = rsslEncodeMsgComplete (&it, RSSL_TRUE /* commit */);
+	if (RSSL_RET_SUCCESS != rc) {
+		LOG(ERROR) << prefix_ << "rsslEncodeMsgComplete: { "
+			  "\"returnCode\": " << static_cast<signed> (rc) << ""
+				", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+			", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+			" }";
+		goto cleanup;
+	}
+	buf->length = rsslGetEncodedBufferLength (&it);
+	LOG_IF(WARNING, 0 == buf->length) << prefix_ << "rsslGetEncodedBufferLength returned 0.";
+
+/* Message validation. */
+	if (!rsslValidateMsg (reinterpret_cast<RsslMsg*> (&response))) {
+		cumulative_stats_[CLIENT_PC_MMT_DIRECTORY_MALFORMED]++;
+		LOG(ERROR) << prefix_ << "rsslValidateMsg failed.";
+		goto cleanup;
+	} else {
+		cumulative_stats_[CLIENT_PC_MMT_DIRECTORY_VALIDATED]++;
+		LOG(INFO) << prefix_ << "rsslValidateMsg succeeded.";
+	}
+
+	if (!Submit (buf)) {
+		LOG(ERROR) << prefix_ << "Submit failed.";
+		goto cleanup;
+	}
+	cumulative_stats_[CLIENT_PC_MMT_DIRECTORY_SENT]++;
+	return true;
+cleanup:
+	if (RSSL_RET_SUCCESS != rsslReleaseBuffer (buf, &rssl_err)) {
+		LOG(WARNING) << prefix_ << "rsslReleaseBuffer: { "
+			  "\"rsslErrorId\": " << rssl_err.rsslErrorId << ""
+			", \"sysError\": " << rssl_err.sysError << ""
+			", \"text\": \"" << rssl_err.text << "\""
+			" }";
+	}
+	return false;
 }
 
 bool
 anaguma::client_t::SendClose (
-	rfa::sessionLayer::RequestToken*const request_token,
-	uint32_t service_id,
+	int32_t request_token,
+	uint16_t service_id,
 	uint8_t model_type,
-	const char* name_c,
+	const char* name,
+	size_t name_len,
 	bool use_attribinfo_in_updates,
 	uint8_t status_code
 	)
 {
+	RsslStatusMsg response = RSSL_INIT_STATUS_MSG;
+#ifndef NDEBUG
+/* Static initialisation sets all fields rather than only the minimal set
+ * required.  Use for debug mode and optimise for release builds.
+ */
+	RsslEncodeIterator it = RSSL_INIT_ENCODE_ITERATOR;
+#else
+	RsslEncodeIterator it
+	rsslClearEncodeIterator (&it);
+#endif
+	RsslBuffer* buf;
+	RsslError rssl_err;
+	RsslRet rc;
+
 	VLOG(2) << prefix_ << "Sending item close { "
-		  "\"RequestToken\": " << request_token <<
-		", \"ServiceID\": " << service_id <<
-		", \"MsgModelType\": " << (int)model_type <<
-		", \"Name\": \"" << name_c << "\""
-		", \"AttribInfoInUpdates\": " << (use_attribinfo_in_updates ? "true" : "false") <<
-		", \"StatusCode\": " << (int)status_code <<
+		  "\"RequestToken\": " << request_token << ""
+		", \"ServiceID\": " << service_id << ""
+		", \"MsgModelType\": " << internal::domain_type_string (static_cast<RsslDomainTypes> (model_type)) << ""
+		", \"Name\": \"" << std::string (name, name_len) << "\""
+		", \"NameLen\": " << name_len << ""
+		", \"AttribInfoInUpdates\": " << (use_attribinfo_in_updates ? "true" : "false") << ""
+		", \"StatusCode\": " << rsslStateCodeToString (status_code) << ""
 		" }";
-/* 7.5.9.1 Create a response message (4.2.2) */
-	auto& response = provider_->response_;
-	response.clear();
+
 /* 7.5.9.2 Set the message model type of the response. */
-	response.setMsgModelType (model_type);
+	response.msgBase.domainType = model_type;
 /* 7.5.9.3 Set response type. */
-	response.setRespType (rfa::message::RespMsg::StatusEnum);
+	response.msgBase.msgClass = RSSL_MC_STATUS;
+/* No payload. */
+	response.msgBase.containerType = RSSL_DT_NO_DATA;
+/* Set the request token. */
+	response.msgBase.streamId = request_token;
 
 /* RDM 6.2.3 AttribInfo
  * if the ReqMsg set AttribInfoInUpdates, then the AttribInfo must be provided for all
  * Refresh, Status, and Update RespMsgs.
  */
 	if (use_attribinfo_in_updates) {
-/* 7.5.9.5 Create or re-use a request attribute object (4.2.4) */
-		auto& attribInfo = provider_->attribInfo_;
-		attribInfo.clear();
-		attribInfo.setNameType (rfa::rdm::INSTRUMENT_NAME_RIC);
-		const RFA_String name (name_c, 0, false);	/* reference */
-		attribInfo.setServiceID (service_id);
-		attribInfo.setName (name);
-		response.setAttribInfo (attribInfo);
+		response.msgBase.msgKey.serviceId   = service_id;
+		response.msgBase.msgKey.nameType    = RDM_INSTRUMENT_NAME_TYPE_RIC;
+		response.msgBase.msgKey.name.data   = const_cast<char*> (name);
+		response.msgBase.msgKey.name.length = static_cast<uint32_t> (name_len);
+		response.msgBase.msgKey.flags = RSSL_MKF_HAS_SERVICE_ID | RSSL_MKF_HAS_NAME_TYPE | RSSL_MKF_HAS_NAME;
+		response.flags |= RSSL_STMF_HAS_MSG_KEY;
 	}
 	
-	auto& status = provider_->status_;
-	status.clear();
-/* Item interaction state: Open, Closed, ClosedRecover, Redirected, NonStreaming, or Unspecified. */
-	status.setStreamState (rfa::common::RespStatus::ClosedEnum);
-/* Data quality state: Ok, Suspect, or Unspecified. */
-	status.setDataState (rfa::common::RespStatus::OkEnum);
-/* Error code, e.g. NotFound, InvalidArgument, ... */
-	status.setStatusCode (rfa::common::RespStatus::NotFoundEnum);
-	response.setRespStatus (status);
+/* Item interaction state. */
+	response.state.streamState = RSSL_STREAM_CLOSED;
+/* Data quality state. */
+	response.state.dataState = RSSL_DATA_OK;
+/* Error code. */
+	response.state.code = status_code;
+
+	buf = rsslGetBuffer (handle_, MAX_MSG_SIZE, RSSL_FALSE /* not packed */, &rssl_err);
+	if (nullptr == buf) {
+		LOG(ERROR) << prefix_ << "rsslGetBuffer: { "
+			  "\"rsslErrorId\": " << rssl_err.rsslErrorId << ""
+			", \"sysError\": " << rssl_err.sysError << ""
+			", \"text\": \"" << rssl_err.text << "\""
+			", \"size\": " << MAX_MSG_SIZE << ""
+			", \"packedBuffer\": false"
+			" }";
+		return false;
+	}
+	rc = rsslSetEncodeIteratorBuffer (&it, buf);
+	if (RSSL_RET_SUCCESS != rc) {
+		LOG(ERROR) << prefix_ << "rsslSetEncodeIteratorBuffer: { "
+			  "\"returnCode\": " << static_cast<signed> (rc) << ""
+			", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+			", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+			" }";
+		goto cleanup;
+	}
+	rc = rsslSetEncodeIteratorRWFVersion (&it, GetRwfMajorVersion(), GetRwfMinorVersion());
+	if (RSSL_RET_SUCCESS != rc) {
+		LOG(ERROR) << prefix_ << "rsslSetEncodeIteratorRWFVersion: { "
+			  "\"returnCode\": " << static_cast<signed> (rc) << ""
+			", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+			", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+			", \"majorVersion\": " << static_cast<unsigned> (GetRwfMajorVersion()) << ""
+			", \"minorVersion\": " << static_cast<unsigned> (GetRwfMinorVersion()) << ""
+			" }";
+		goto cleanup;
+	}
+	rc = rsslEncodeMsg (&it, reinterpret_cast<RsslMsg*> (&response));
+	if (RSSL_RET_SUCCESS != rc) {
+		LOG(ERROR) << prefix_ << "rsslEncodeMsg: { "
+			  "\"returnCode\": " << static_cast<signed> (rc) << ""
+			", \"enumeration\": \"" << rsslRetCodeToString (rc) << "\""
+			", \"text\": \"" << rsslRetCodeInfo (rc) << "\""
+			" }";
+		goto cleanup;
+	}
+	buf->length = rsslGetEncodedBufferLength (&it);
+	LOG_IF(WARNING, 0 == buf->length) << prefix_ << "rsslGetEncodedBufferLength returned 0.";
 
 	if (DCHECK_IS_ON()) {
-/* 4.2.8 Message Validation.  RFA provides an interface to verify that
- * constructed messages of these types conform to the Reuters Domain
- * Models as specified in RFA API 7 RDM Usage Guide.
- */
-		uint8_t validation_status = rfa::message::MsgValidationError;
-		try {
-			RFA_String warningText;
-			validation_status = response.validateMsg (&warningText);
-			cumulative_stats_[CLIENT_PC_ITEM_VALIDATED]++;
-			if (rfa::message::MsgValidationWarning == validation_status)
-				LOG(ERROR) << prefix_ << "validateMsg: { \"warningText\": \"" << warningText << "\" }";
-		} catch (const rfa::common::InvalidUsageException& e) {
-			cumulative_stats_[CLIENT_PC_ITEM_MALFORMED]++;
-			LOG(ERROR) << prefix_ <<
-				"InvalidUsageException: { " <<
-				   "\"StatusText\": \"" << e.getStatus().getStatusText() << "\""
-				", " << response <<
-				" }";
-		} catch (const std::exception& e) {
-			LOG(ERROR) << prefix_ << "Rfa::Exception: { "
-				"\"What\": \"" << e.what() << "\" }";
+/* Message validation. */
+		if (!rsslValidateMsg (reinterpret_cast<RsslMsg*> (&response))) {
+			cumulative_stats_[CLIENT_PC_ITEM_CLOSE_MALFORMED]++;
+			LOG(ERROR) << prefix_ << "rsslValidateMsg failed.";
+			goto cleanup;
+		} else {
+			cumulative_stats_[CLIENT_PC_ITEM_CLOSE_VALIDATED]++;
+			LOG(INFO) << prefix_ << "rsslValidateMsg succeeded.";
 		}
 	}
 
-	Submit (&response, request_token, nullptr);	
+	if (!Submit (buf)) {
+		goto cleanup;
+	}
 	cumulative_stats_[CLIENT_PC_ITEM_CLOSED]++;
 	return true;
+cleanup:
+	if (RSSL_RET_SUCCESS != rsslReleaseBuffer (buf, &rssl_err)) {
+		LOG(WARNING) << prefix_ << "rsslReleaseBuffer: { "
+			  "\"rsslErrorId\": " << rssl_err.rsslErrorId << ""
+			", \"sysError\": " << rssl_err.sysError << ""
+			", \"text\": \"" << rssl_err.text << "\""
+			" }";
+	}
+	return false;
 }
 
 /* Forward submit requests to containing provider.
  */
-uint32_t
+int
 anaguma::client_t::Submit (
-	rfa::message::RespMsg*const response,
-	rfa::sessionLayer::RequestToken*const token,
-	void* closure
+	RsslBuffer* buf
 	)
 {
-	return provider_->Submit (static_cast<rfa::common::Msg*const> (response), token, closure);
+	const int status = provider_->Submit (handle_, buf);
+	if (status) cumulative_stats_[CLIENT_PC_UPA_MSGS_SENT]++;
+	return status;
 }
 
 /* eof */

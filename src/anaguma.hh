@@ -1,4 +1,4 @@
-/* RFA interactive fake snapshot provider.
+/* UPA interactive fake snapshot provider.
  *
  * An interactive provider sits listening on a port for RSSL connections,
  * once a client is connected requests may be submitted for snapshots or
@@ -10,39 +10,21 @@
  * client to wait for a subsequent broadcast to actually see data.
  */
 
-#ifndef __ANAGUMA_HH__
-#define __ANAGUMA_HH__
-#pragma once
+#ifndef ANAGUMA_HH_
+#define ANAGUMA_HH_
 
 #include <cstdint>
-#include <forward_list>
 #include <memory>
-
-/* Boost Chrono. */
-#include <boost/chrono.hpp>
 
 /* Boost noncopyable base class */
 #include <boost/utility.hpp>
 
-/* Boost threading. */
-#include <boost/thread.hpp>
-
-/* RFA 7.2 */
-#include <rfa/rfa.hh>
-
-#include "chromium/logging.hh"
-
 #include "config.hh"
 #include "provider.hh"
 
-namespace logging
-{
-	class LogEventProvider;
-}
-
 namespace anaguma
 {
-	class rfa_t;
+	class upa_t;
 	class provider_t;
 
 	class anaguma_t :
@@ -66,21 +48,15 @@ namespace anaguma
 /* Application configuration. */
 		config_t config_;
 
-/* RFA context. */
-		std::shared_ptr<rfa_t> rfa_;
+/* UPA context. */
+		std::shared_ptr<upa_t> upa_;
 
-/* RFA asynchronous event queue. */
-		std::shared_ptr<rfa::common::EventQueue> event_queue_;
-
-/* RFA logging */
-		std::shared_ptr<logging::LogEventProvider> log_;
-
-/* RFA provider */
+/* UPA provider */
 		std::shared_ptr<provider_t> provider_;	
 	};
 
 } /* namespace anaguma */
 
-#endif /* __ANAGUMA_HH__ */
+#endif /* ANAGUMA_HH_ */
 
 /* eof */

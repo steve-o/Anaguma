@@ -1,13 +1,15 @@
-/* RFA provider.
+/* UPA provider.
  */
 
-#ifndef __PROVIDER_HH__
-#define __PROVIDER_HH__
-#pragma once
+#ifndef PROVIDER_HH_
+#define PROVIDER_HH_
+
+#include <winsock2.h>
 
 #include <cstdint>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 /* Boost Atomics */
@@ -22,10 +24,10 @@
 /* Boost threading. */
 #include <boost/thread.hpp>
 
-/* RFA 7.2 */
-#include <rfa/rfa.hh>
+/* UPA 7.2 */
+#include <upa/upa.h>
 
-#include "rfa.hh"
+#include "upa.hh"
 #include "config.hh"
 #include "deleter.hh"
 
@@ -33,16 +35,42 @@ namespace anaguma
 {
 /* Performance Counters */
 	enum {
+		PROVIDER_PC_BYTES_RECEIVED,
+		PROVIDER_PC_UNCOMPRESSED_BYTES_RECEIVED,
 		PROVIDER_PC_MSGS_SENT,
-		PROVIDER_PC_RFA_MSGS_SENT,
-		PROVIDER_PC_RFA_EVENTS_RECEIVED,
-		PROVIDER_PC_RFA_EVENTS_DISCARDED,
-		PROVIDER_PC_OMM_CMD_ERRORS,
-		PROVIDER_PC_CONNECTION_EVENTS_RECEIVED,
+		PROVIDER_PC_UPA_MSGS_ENQUEUED,
+		PROVIDER_PC_UPA_MSGS_SENT,
+		PROVIDER_PC_UPA_MSGS_RECEIVED,
+		PROVIDER_PC_UPA_MSGS_DECODED,
+		PROVIDER_PC_UPA_MSGS_MALFORMED,
+		PROVIDER_PC_UPA_MSGS_VALIDATED,
+		PROVIDER_PC_CONNECTION_RECEIVED,
+		PROVIDER_PC_CONNECTION_REJECTED,
+		PROVIDER_PC_CONNECTION_ACCEPTED,
+		PROVIDER_PC_CONNECTION_EXCEPTION,
+		PROVIDER_PC_RWF_VERSION_UNSUPPORTED,
+		PROVIDER_PC_UPA_PING_SENT,
+		PROVIDER_PC_UPA_PONG_RECEIVED,
+		PROVIDER_PC_UPA_PONG_TIMEOUT,
+		PROVIDER_PC_UPA_PROTOCOL_DOWNGRADE,
+		PROVIDER_PC_UPA_FLUSH,
 		PROVIDER_PC_OMM_ACTIVE_CLIENT_SESSION_RECEIVED,
 		PROVIDER_PC_OMM_ACTIVE_CLIENT_SESSION_EXCEPTION,
 		PROVIDER_PC_CLIENT_SESSION_REJECTED,
 		PROVIDER_PC_CLIENT_SESSION_ACCEPTED,
+		PROVIDER_PC_UPA_RECONNECT,
+		PROVIDER_PC_UPA_CONGESTION_DETECTED,
+		PROVIDER_PC_UPA_SLOW_READER,
+		PROVIDER_PC_UPA_PACKET_GAP_DETECTED,
+		PROVIDER_PC_UPA_READ_FAILURE,
+		PROVIDER_PC_CLIENT_INIT_EXCEPTION,
+		PROVIDER_PC_DIRECTORY_MAP_EXCEPTION,
+		PROVIDER_PC_UPA_PING_EXCEPTION,
+		PROVIDER_PC_UPA_PING_FLUSH_FAILED,
+		PROVIDER_PC_UPA_PING_NO_BUFFERS,
+		PROVIDER_PC_UPA_WRITE_EXCEPTION,
+		PROVIDER_PC_UPA_WRITE_FLUSH_FAILED,
+		PROVIDER_PC_UPA_WRITE_NO_BUFFERS,
 /* marker */
 		PROVIDER_PC_MAX
 	};
@@ -79,27 +107,25 @@ namespace anaguma
 		}
 
 /* Fixed name for this stream. */
-		rfa::common::RFA_String rfa_name;
+//		rfa::common::RFA_String rfa_name;
 /* Request tokens for clients, can be more than one per client. */
-		std::unordered_map<rfa::sessionLayer::RequestToken*const, std::shared_ptr<request_t>> requests;
+//		std::unordered_map<rfa::sessionLayer::RequestToken*const, std::shared_ptr<request_t>> requests;
 		boost::shared_mutex lock;
 	};
 
 	class provider_t :
 		public std::enable_shared_from_this<provider_t>,
-		public rfa::common::Client,
 		boost::noncopyable
 	{
 	public:
-		provider_t (const config_t& config, std::shared_ptr<rfa_t> rfa, std::shared_ptr<rfa::common::EventQueue> event_queue);
+		provider_t (const config_t& config, std::shared_ptr<upa_t> upa);
 		~provider_t();
 
-		bool Init() throw (rfa::common::InvalidConfigurationException, rfa::common::InvalidUsageException);
+		bool Init();
 
-		uint32_t Submit (rfa::common::Msg*const msg, rfa::sessionLayer::RequestToken*const token, void* closure) throw (rfa::common::InvalidUsageException);
-
-/* RFA event callback. */
-		void processEvent (const rfa::common::Event& event) override;
+		void Run();
+		void Quit();
+		void Close();
 
 		uint16_t GetRwfVersion() const {
 			return min_rwf_version_.load();
@@ -107,85 +133,84 @@ namespace anaguma
 		const char* GetServiceName() const {
 			return config_.service_name.c_str();
 		}
-		uint32_t GetServiceId() const {
+		uint16_t GetServiceId() const {
 			return service_id_;
 		}
 
 	private:
-		void OnConnectionEvent (const rfa::sessionLayer::ConnectionEvent& event);
-		void OnOMMActiveClientSessionEvent (const rfa::sessionLayer::OMMActiveClientSessionEvent& event);
-		void OnOMMCmdErrorEvent (const rfa::sessionLayer::OMMCmdErrorEvent& event);
+		bool DoWork();
 
-		bool RejectClientSession (const rfa::common::Handle* handle, const char* address);
-		bool AcceptClientSession (const rfa::common::Handle* handle, const char* address);
-		bool EraseClientSession (rfa::common::Handle*const handle);
+		void OnConnection (RsslServer* rssl_sock);
+		void RejectConnection (RsslServer* rssl_sock);
+		void AcceptConnection (RsslServer* rssl_sock);
 
-		void GetDirectoryResponse (rfa::message::RespMsg*const msg, uint8_t rwf_major_version, uint8_t rwf_minor_version, const char* service_name, uint32_t filter_mask, uint8_t response_type);
-		void GetServiceDirectory (rfa::data::Map*const map, rfa::data::SingleWriteIterator*const it, uint8_t rwf_major_version, uint8_t rwf_minor_version, const char* service_name, uint32_t filter_mask);
-		void GetServiceFilterList (rfa::data::SingleWriteIterator*const it, uint8_t rwf_major_version, uint8_t rwf_minor_version, uint32_t filter_mask);
-		void GetServiceInformation (rfa::data::SingleWriteIterator*const it, uint8_t rwf_major_version, uint8_t rwf_minor_version);
-		void GetServiceCapabilities (rfa::data::SingleWriteIterator*const it);
-		void GetServiceDictionaries (rfa::data::SingleWriteIterator*const it);
-		void GetServiceState (rfa::data::SingleWriteIterator*const it, uint8_t rwf_major_version, uint8_t rwf_minor_version);
+		void OnCanReadWithoutBlocking (RsslChannel* handle);
+		void OnCanWriteWithoutBlocking (RsslChannel* handle);
+		void Abort (RsslChannel* handle);
+		void Close (RsslChannel* handle);
 
-		bool AddRequest (rfa::sessionLayer::RequestToken*const token, std::shared_ptr<anaguma::client_t> client);
-		bool RemoveRequest (rfa::sessionLayer::RequestToken*const token);
+		void OnInitializingState (RsslChannel* handle);
+		void OnActiveClientSession (RsslChannel* handle);
+		void RejectClientSession (RsslChannel* handle, const char* address);
+		bool AcceptClientSession (RsslChannel* handle, const char* address);
+//		bool EraseClientSession (rfa::common::Handle*const handle);
 
-		void SetServiceId (uint32_t service_id) {
+		void OnActiveState (RsslChannel* handle);
+		void OnMsg (RsslChannel* handle, RsslBuffer* buf);
+
+		bool GetDirectoryMap (RsslEncodeIterator*const it, const char* service_name, uint32_t filter_mask, unsigned map_action);
+		bool GetServiceDirectory (RsslEncodeIterator*const it, const char* service_name, uint32_t filter_mask);
+		bool GetServiceFilterList (RsslEncodeIterator*const it, uint32_t filter_mask);
+		bool GetServiceInformation (RsslEncodeIterator*const it);
+		bool GetServiceCapabilities (RsslEncodeIterator*const it);
+		bool GetServiceDictionaries (RsslEncodeIterator*const it);
+		bool GetServiceQoS (RsslEncodeIterator*const it);
+		bool GetServiceState (RsslEncodeIterator*const it);
+
+		bool AddRequest (int32_t token, std::shared_ptr<anaguma::client_t> client);
+		bool RemoveRequest (int32_t token);
+
+		int Submit (RsslChannel* c, RsslBuffer* buf);
+		int Ping (RsslChannel* c);
+
+		void SetServiceId (uint16_t service_id) {
 			service_id_.store (service_id);
 		}
 
 		const config_t& config_;
 
-/* RFA context. */
-		std::shared_ptr<rfa_t> rfa_;
+/* UPA context. */
+		std::shared_ptr<upa_t> upa_;
+		RsslServer* rssl_sock_;
+/* This flag is set to false when Run should return. */
+		bool keep_running_;
 
-/* RFA asynchronous event queue. */
-		std::shared_ptr<rfa::common::EventQueue> event_queue_;
+		int in_nfds_, out_nfds_;
+		fd_set in_rfds_, in_wfds_, in_efds_;
+		fd_set out_rfds_, out_wfds_, out_efds_;
+		struct timeval in_tv_, out_tv_;
 
-/* RFA session defines one or more connections for horizontal scaling. */
-		std::unique_ptr<rfa::sessionLayer::Session, internal::release_deleter> session_;
+/* UPA connection directory */
+		std::list<RsslChannel*const> connections_;
 
-/* RFA OMM provider interface. */
-		std::unique_ptr<rfa::sessionLayer::OMMProvider, internal::destroy_deleter> omm_provider_;
-
-/* RFA Connection event consumer */
-		rfa::common::Handle* connection_item_handle_;
-/* RFA Listen event consumer */
-		rfa::common::Handle* listen_item_handle_;
-/* RFA Error Item event consumer */
-		rfa::common::Handle* error_item_handle_;
-
-/* RFA Client Session directory */
-		std::unordered_map<rfa::common::Handle*const, std::shared_ptr<client_t>> clients_;
+/* UPA Client Session directory */
+		std::unordered_map<RsslChannel*const, std::shared_ptr<client_t>> clients_;
 		boost::shared_mutex clients_lock_;
 
 		friend client_t;
 
 /* Entire request set */
-		std::unordered_map<rfa::sessionLayer::RequestToken*const, std::weak_ptr<client_t>> requests_;
+		std::unordered_map<int32_t, std::weak_ptr<client_t>> requests_;
 		boost::shared_mutex requests_lock_;
 
 /* Reuters Wire Format versions. */
 		boost::atomic_uint16_t min_rwf_version_;
 
 /* Directory mapped ServiceID */
-		boost::atomic_uint32_t service_id_;
-
-/* Pre-allocated shared resource. */
-		rfa::message::RespMsg response_;
-		rfa::data::Array array_;
-		rfa::data::ElementList elementList_;
-		rfa::data::FilterList filterList_;
-		rfa::data::FieldList fields_;	/* no copy ctor */
-		rfa::message::AttribInfo attribInfo_;
-		rfa::common::RespStatus status_;
-/* Client shared resource. */
-		rfa::data::Map map_;
-
-/* Iterator for populating publish fields */
-		rfa::data::SingleWriteIterator map_it_, element_it_, field_it_;
-
+		boost::atomic_uint16_t service_id_;
+public:
+unsigned service_state_;
+private:
 /* RFA can reject new client requests whilst maintaining current connected sessions.
  */
 		bool is_accepting_connections_;
@@ -203,6 +228,6 @@ namespace anaguma
 
 } /* namespace anaguma */
 
-#endif /* __PROVIDER_HH__ */
+#endif /* PROVIDER_HH_ */
 
 /* eof */

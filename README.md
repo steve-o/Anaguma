@@ -1,1 +1,1 @@
-Basic RFA interactive publisher providing only fake snapshots.
+Basic UPA interactive publisher providing only fake snapshots.
