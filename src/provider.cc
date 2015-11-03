@@ -68,7 +68,7 @@ anaguma::provider_t::Init()
 	RsslBindOptions addr = RSSL_INIT_BIND_OPTS;
 #else
 	RsslBindOptions addr;
-	rsslClearBindOptions (&addr);
+	rsslClearBindOpts (&addr);
 #endif
 	RsslError upa_err;
 
@@ -362,7 +362,7 @@ anaguma::provider_t::RejectConnection (
 	RsslAcceptOptions addr = RSSL_INIT_ACCEPT_OPTS;
 #else
 	RsslAcceptOptions addr;
-	rsslClearAcceptOptions (&addr);
+	rsslClearAcceptOpts (&addr);
 #endif
 	RsslError rssl_err;
 
@@ -391,7 +391,7 @@ anaguma::provider_t::AcceptConnection (
 	RsslAcceptOptions addr = RSSL_INIT_ACCEPT_OPTS;
 #else
 	RsslAcceptOptions addr;
-	rsslClearAcceptOptions (&addr);
+	rsslClearAcceptOpts (&addr);
 #endif
 	RsslError rssl_err;
 
@@ -1448,7 +1448,7 @@ anaguma::provider_t::GetServiceQoS (
 	RsslArray rssl_array;
 	RsslQos qos;
 	rsslClearArray (&rssl_array);
-	rsslClearQoS (&qos);
+	rsslClearQos (&qos);
 #endif
 	RsslRet rc;
 

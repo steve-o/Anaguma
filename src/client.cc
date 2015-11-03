@@ -1033,7 +1033,7 @@ anaguma::client_t::SendInitial (
 #ifndef NDEBUG
 	RsslEncodeIterator it = RSSL_INIT_ENCODE_ITERATOR;
 #else
-	RsslEncodeIterator it
+	RsslEncodeIterator it;
 	rsslClearEncodeIterator (&it);
 #endif
 	RsslBuffer* buf;
@@ -1516,7 +1516,7 @@ anaguma::client_t::SendDirectoryResponse (
 #ifndef NDEBUG
 	RsslEncodeIterator it = RSSL_INIT_ENCODE_ITERATOR;
 #else
-	RsslEncodeIterator it
+	RsslEncodeIterator it;
 	rsslClearEncodeIterator (&it);
 #endif
 	RsslBuffer* buf;
@@ -1663,7 +1663,7 @@ anaguma::client_t::SendDirectoryUpdate (
 #ifndef NDEBUG
 	RsslEncodeIterator it = RSSL_INIT_ENCODE_ITERATOR;
 #else
-	RsslEncodeIterator it
+	RsslEncodeIterator it;
 	rsslClearEncodeIterator (&it);
 #endif
 	RsslBuffer* buf;
@@ -1811,7 +1811,7 @@ anaguma::client_t::SendClose (
  */
 	RsslEncodeIterator it = RSSL_INIT_ENCODE_ITERATOR;
 #else
-	RsslEncodeIterator it
+	RsslEncodeIterator it;
 	rsslClearEncodeIterator (&it);
 #endif
 	RsslBuffer* buf;
@@ -1856,6 +1856,7 @@ anaguma::client_t::SendClose (
 	response.state.dataState = RSSL_DATA_OK;
 /* Error code. */
 	response.state.code = status_code;
+	response.flags |= RSSL_STMF_HAS_STATE;
 
 	buf = rsslGetBuffer (handle_, MAX_MSG_SIZE, RSSL_FALSE /* not packed */, &rssl_err);
 	if (nullptr == buf) {
